@@ -16,6 +16,7 @@ members = [
     "crates/hft-session",
     "crates/hft-journal",
     "crates/hft-recovery",
+    "crates/hft-soak",
     "crates/hft-bench",
     "crates/hft-cli",
 ]

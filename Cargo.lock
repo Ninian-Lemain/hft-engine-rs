@@ -257,6 +257,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-soak"
+version = "0.19.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "hft-spsc"
 version = "0.19.0"
 dependencies = [

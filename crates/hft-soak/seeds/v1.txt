@@ -1,0 +1,5 @@
+# Retained v1 soak seeds. Keep entries sorted.
+0000000000000001
+127be615fe22a934
+5eed5eed5eed5eed
+deadbeefcafef00d
