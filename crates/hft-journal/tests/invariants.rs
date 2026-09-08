@@ -108,6 +108,58 @@ fn shutdown_requires_closed_producer_and_drains_tail() {
 }
 
 #[test]
+fn concurrent_close_and_shutdown_persist_every_record() {
+    const RECORDS: usize = 10_000;
+    if skip_loom_queue_test() {
+        return;
+    }
+    let record_count = u64::try_from(RECORDS).expect("record count fits");
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
+    let sink = FaultSink {
+        max_write: RECORD_SIZE,
+        ..FaultSink::default()
+    };
+    let mut worker =
+        PersistenceWorker::<_, 32>::new(reader, sink, FlushPolicy::OnShutdown).expect("worker");
+
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            for sequence in 1..=record_count {
+                loop {
+                    match writer.enqueue(&payload(sequence)) {
+                        Ok(written) => {
+                            assert_eq!(written, SequenceNumber(sequence));
+                            break;
+                        }
+                        Err(JournalError::Saturated) => std::thread::yield_now(),
+                        Err(error) => panic!("unexpected enqueue error: {error:?}"),
+                    }
+                }
+            }
+            writer.close();
+        });
+
+        loop {
+            worker.drain_batch().expect("concurrent drain");
+            match worker.shutdown() {
+                Ok(()) => break,
+                Err(PersistError::ProducerOpen) => std::thread::yield_now(),
+                Err(error) => panic!("unexpected shutdown error: {error:?}"),
+            }
+        }
+        producer.join().expect("producer thread");
+    });
+
+    let sink = worker.into_sink().expect("healthy sink");
+    assert_eq!(sink.flushes, 1);
+    assert_eq!(sink.bytes.len(), RECORDS * RECORD_SIZE);
+    let recovered = recover(&mut Cursor::new(sink.bytes), 1).expect("recovery");
+    assert_eq!(recovered.records, record_count);
+    assert_eq!(recovered.next_sequence, record_count + 1);
+}
+
+#[test]
 fn oversized_payload_and_sequence_overflow_publish_nothing() {
     if skip_loom_queue_test() {
         return;
