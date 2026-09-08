@@ -119,6 +119,86 @@ fn replay_fixture_gates_the_gateway_through_the_session() {
     );
 }
 
+#[test]
+fn reconnect_and_resume_matches_uninterrupted_execution() {
+    let frames = [
+        order_frame(1, 1, Side::Sell),
+        order_frame(2, 2, Side::Buy),
+        order_frame(3, 1, Side::Sell),
+        order_frame(4, 2, Side::Buy),
+    ];
+
+    let mut uninterrupted_session = SessionStateMachine::new(SessionConfig::default());
+    let mut uninterrupted_gateway = new_gateway();
+    let mut uninterrupted_reports = ReportBuffer::<4>::new();
+    activate(&mut uninterrupted_session, SequenceNumber(1), 0);
+    for (index, frame) in frames.iter().enumerate() {
+        let sequence = SequenceNumber(index as u64 + 1);
+        uninterrupted_session
+            .handle(SessionEvent::Command { sequence }, sequence.0)
+            .expect("uninterrupted command admitted");
+        uninterrupted_gateway
+            .process_frame(&RxFrame::from_bytes(frame), &mut uninterrupted_reports)
+            .expect("uninterrupted command accepted");
+    }
+
+    let mut resumed_session = SessionStateMachine::new(SessionConfig::default());
+    let mut resumed_gateway = new_gateway();
+    let mut resumed_reports = ReportBuffer::<4>::new();
+    activate(&mut resumed_session, SequenceNumber(1), 0);
+    for (index, frame) in frames[..2].iter().enumerate() {
+        let sequence = SequenceNumber(index as u64 + 1);
+        resumed_session
+            .handle(SessionEvent::Command { sequence }, sequence.0)
+            .expect("prefix command admitted");
+        resumed_gateway
+            .process_frame(&RxFrame::from_bytes(frame), &mut resumed_reports)
+            .expect("prefix command accepted");
+    }
+
+    resumed_session
+        .handle(SessionEvent::Disconnect, 3)
+        .expect("disconnect accepted");
+    activate(&mut resumed_session, SequenceNumber(3), 4);
+    for (index, frame) in frames[2..].iter().enumerate() {
+        let sequence = SequenceNumber(index as u64 + 3);
+        resumed_session
+            .handle(SessionEvent::Command { sequence }, sequence.0 + 4)
+            .expect("resumed command admitted");
+        resumed_gateway
+            .process_frame(&RxFrame::from_bytes(frame), &mut resumed_reports)
+            .expect("resumed command accepted");
+    }
+
+    assert_eq!(uninterrupted_session.state(), SessionState::Active);
+    assert_eq!(resumed_session.state(), uninterrupted_session.state());
+    assert_eq!(uninterrupted_session.expected_sequence(), SequenceNumber(5));
+    assert_eq!(
+        resumed_session.expected_sequence(),
+        uninterrupted_session.expected_sequence()
+    );
+    assert_eq!(
+        resumed_gateway.expected_sequence(),
+        resumed_session.expected_sequence()
+    );
+    assert_eq!(
+        uninterrupted_gateway.stable_digest(),
+        resumed_gateway.stable_digest()
+    );
+}
+
+fn activate(session: &mut SessionStateMachine, first_sequence: SequenceNumber, now: u64) {
+    session
+        .handle(SessionEvent::Connect, now)
+        .expect("connect accepted");
+    session
+        .handle(SessionEvent::LogonSent, now)
+        .expect("logon sent");
+    session
+        .handle(SessionEvent::LogonAccepted { first_sequence }, now)
+        .expect("logon accepted");
+}
+
 /// A replace issued through an active session mutates the resting order it
 /// names, proving the lifecycle composes across both layers.
 #[test]

@@ -21,7 +21,7 @@ fn skip_loom_queue_test() -> bool {
 struct FaultSink {
     bytes: Vec<u8>,
     max_write: usize,
-    interrupt_once: bool,
+    interrupts_remaining: usize,
     fail_after: Option<usize>,
     flushes: usize,
     fail_flush: bool,
@@ -29,8 +29,8 @@ struct FaultSink {
 
 impl DurableSink for FaultSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.interrupt_once {
-            self.interrupt_once = false;
+        if self.interrupts_remaining != 0 {
+            self.interrupts_remaining -= 1;
             return Err(io::Error::from(io::ErrorKind::Interrupted));
         }
         if self
@@ -168,7 +168,7 @@ fn persistence_handles_short_and_interrupted_writes_then_flushes() {
     writer.close();
     let sink = FaultSink {
         max_write: 7,
-        interrupt_once: true,
+        interrupts_remaining: 3,
         ..FaultSink::default()
     };
     let mut worker =
@@ -182,6 +182,47 @@ fn persistence_handles_short_and_interrupted_writes_then_flushes() {
     let recovered = recover(&mut Cursor::new(sink.bytes), 1).expect("recovery");
     assert_eq!(recovered.records, 3);
     assert_eq!(recovered.next_sequence, 4);
+}
+
+enum InvalidWriteSink {
+    Zero,
+    Oversized,
+}
+
+impl DurableSink for InvalidWriteSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Zero => Ok(0),
+            Self::Oversized => Ok(bytes.len() + 1),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn invalid_sink_write_counts_poison_persistence() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    for (sink, kind) in [
+        (InvalidWriteSink::Zero, io::ErrorKind::WriteZero),
+        (InvalidWriteSink::Oversized, io::ErrorKind::InvalidData),
+    ] {
+        let mut channel = JournalChannel::try_new().expect("channel");
+        let (mut writer, reader) = channel.split(1);
+        writer.enqueue(b"one").expect("enqueue");
+        writer.close();
+        let mut worker =
+            PersistenceWorker::<_, 1>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
+        assert!(matches!(
+            worker.drain_batch(),
+            Err(PersistError::Io(error)) if error.kind() == kind
+        ));
+        assert!(matches!(worker.shutdown(), Err(PersistError::Poisoned)));
+    }
 }
 
 #[test]

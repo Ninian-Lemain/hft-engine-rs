@@ -610,6 +610,110 @@ mod tests {
     }
 
     #[test]
+    fn pending_command_retries_before_the_next_queued_command() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut commands = SpscQueue::<Command, 2>::try_new().expect("command queue");
+        let (mut command_producer, command_consumer) = commands.split();
+        let mut events = SpscQueue::<TestBatch, 1>::try_new().expect("event queue");
+        let (event_producer, mut event_consumer) = events.split();
+        let mut shard = MatchingShard::<2, 8, 4, 4, 4, 6, 2, 1>::try_new(
+            FIRST,
+            gateway(FIRST.instrument_id),
+            command_consumer,
+            event_producer,
+        )
+        .expect("shard");
+
+        command_producer
+            .try_push(Command::NewOrder(order(1, FIRST.instrument_id, 1)))
+            .expect("seed command");
+        assert_eq!(
+            shard.try_process_one(),
+            Ok(ShardStep::Processed(SequenceNumber(1)))
+        );
+
+        command_producer
+            .try_push(Command::NewOrder(order(2, FIRST.instrument_id, 2)))
+            .expect("command A");
+        command_producer
+            .try_push(Command::NewOrder(order(3, FIRST.instrument_id, 3)))
+            .expect("command B");
+        for _ in 0..2 {
+            assert_eq!(shard.try_process_one(), Err(ShardError::EventBackpressured));
+            assert!(shard.has_pending_command());
+            assert_eq!(shard.gateway().expected_sequence(), SequenceNumber(2));
+        }
+
+        assert!(event_consumer.try_pop().is_some());
+        assert_eq!(
+            shard.try_process_one(),
+            Ok(ShardStep::Processed(SequenceNumber(2)))
+        );
+        let command_a = event_consumer.try_pop().expect("command A events");
+        assert_eq!(command_a.len(), 2);
+        assert!(command_a.iter().all(|event| match event {
+            Event::Accepted(event) => event.id.command_sequence == SequenceNumber(2),
+            Event::TopOfBook(event) => event.id.command_sequence == SequenceNumber(2),
+            _ => false,
+        }));
+        assert!(event_consumer.try_pop().is_none());
+
+        assert_eq!(
+            shard.try_process_one(),
+            Ok(ShardStep::Processed(SequenceNumber(3)))
+        );
+        let command_b = event_consumer.try_pop().expect("command B events");
+        assert_eq!(command_b.len(), 2);
+        assert!(command_b.iter().all(|event| match event {
+            Event::Accepted(event) => event.id.command_sequence == SequenceNumber(3),
+            Event::TopOfBook(event) => event.id.command_sequence == SequenceNumber(3),
+            _ => false,
+        }));
+        assert!(event_consumer.try_pop().is_none());
+        assert!(!shard.has_pending_command());
+        assert_eq!(shard.gateway().expected_sequence(), SequenceNumber(4));
+        assert_eq!(shard.try_process_one(), Ok(ShardStep::Idle));
+    }
+
+    #[test]
+    fn saturated_shard_does_not_block_the_other_shard() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut command_zero = SpscQueue::<Command, 1>::try_new().expect("command zero");
+        let mut command_one = SpscQueue::<Command, 1>::try_new().expect("command one");
+        let (command_zero_producer, mut command_zero_consumer) = command_zero.split();
+        let (command_one_producer, mut command_one_consumer) = command_one.split();
+        let mut event_zero = SpscQueue::<TestBatch, 1>::try_new().expect("event zero");
+        let mut event_one = SpscQueue::<TestBatch, 1>::try_new().expect("event one");
+        let (_, event_zero_consumer) = event_zero.split();
+        let (_, event_one_consumer) = event_one.split();
+        let mut router = MultiInstrumentRouter::new(
+            RouteTable::try_new([FIRST, SECOND]).expect("routes"),
+            [command_zero_producer, command_one_producer],
+            [event_zero_consumer, event_one_consumer],
+        );
+
+        let blocked = Command::NewOrder(order(1, FIRST.instrument_id, 1));
+        assert_eq!(router.route_command(blocked), Ok(ShardId(0)));
+        assert_eq!(
+            router.route_command(Command::NewOrder(order(2, FIRST.instrument_id, 2))),
+            Err(RouterError::CommandBackpressured(ShardId(0)))
+        );
+
+        for sequence in 1..=32 {
+            let command = Command::NewOrder(order(sequence, SECOND.instrument_id, sequence));
+            assert_eq!(router.route_command(command), Ok(ShardId(1)));
+            assert_eq!(command_one_consumer.try_pop(), Some(command));
+        }
+        assert_eq!(command_zero_consumer.try_pop(), Some(blocked));
+        assert_eq!(command_zero_consumer.try_pop(), None);
+        assert_eq!(command_one_consumer.try_pop(), None);
+    }
+
+    #[test]
     fn shard_constructor_rejects_instrument_mismatch() {
         if hft_spsc::IS_LOOM_BUILD {
             return;
