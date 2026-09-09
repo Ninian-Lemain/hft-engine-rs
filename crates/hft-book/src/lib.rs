@@ -6,12 +6,12 @@ use hft_types::{
     Side, TimeInForce,
 };
 
+// Price belongs to the containing level.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RestingOrder {
     id: OrderId,
     account_id: AccountId,
     index_slot: u32,
-    price: PriceTicks,
     quantity: Quantity,
     sequence: SequenceNumber,
     prev: usize,
@@ -676,7 +676,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                     order_id: order.id,
                     account_id: order.account_id,
                     side,
-                    price: order.price,
+                    price,
                     quantity: order.quantity,
                     sequence: order.sequence,
                 };
@@ -851,7 +851,6 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 id: order.order_id,
                 account_id: order.account_id,
                 index_slot: 0,
-                price: order.price,
                 quantity: order.quantity,
                 sequence: order.sequence,
                 prev: NIL,
@@ -1141,15 +1140,18 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         if replace.quantity.0 == 0 {
             return Err(RejectReason::InvalidQuantity);
         }
-        let old = {
+        let (old, old_price) = {
             let level = self.side_levels(location.side)[location.level_index]
                 .as_ref()
                 .expect("indexed level is occupied");
-            *level.get_live(location.slot).expect("indexed slot is live")
+            (
+                *level.get_live(location.slot).expect("indexed slot is live"),
+                level.price,
+            )
         };
-        let priority_kept = replace.price == old.price && replace.quantity.0 < old.quantity.0;
+        let priority_kept = replace.price == old_price && replace.quantity.0 < old.quantity.0;
         if !priority_kept {
-            if replace.price != old.price {
+            if replace.price != old_price {
                 // A repriced order must not cross: check the opposing best.
                 let opposing = match location.side {
                     Side::Buy => Side::Sell,
@@ -1175,7 +1177,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                     .as_ref()
                     .expect("dest level")
                     .len;
-                let same_level = level_index == location.level_index && replace.price == old.price;
+                let same_level = level_index == location.level_index && replace.price == old_price;
                 if dest_len == ORDERS_PER_LEVEL && !same_level {
                     return Err(RejectReason::PriceLevelOrderCapacity);
                 }
@@ -1225,11 +1227,10 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             .len
             == 0;
         if source_emptied {
-            let price = removed.price;
             self.side_levels_mut(location.side)[location.level_index] = None;
             let removed_index = self
                 .side_index_mut(location.side)
-                .remove(price, location.side == Side::Buy);
+                .remove(old_price, location.side == Side::Buy);
             debug_assert_eq!(removed_index, Some(location.level_index));
         }
         let removed_location = self.remove_index_entry(removed.index_slot, replace.order_id);
@@ -1238,13 +1239,12 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             id: replace.order_id,
             account_id: replace.account_id,
             index_slot: 0,
-            price: replace.price,
             quantity: Quantity(replace.quantity.0),
             sequence: replace.sequence,
             prev: NIL,
             next: NIL,
         };
-        self.rest_at_tail(location.side, resting);
+        self.rest_at_tail(location.side, replace.price, resting);
         Ok(ReplacedOrder {
             order_id: replace.order_id,
             account_id: replace.account_id,
@@ -1321,18 +1321,17 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             id: order.order_id,
             account_id: order.account_id,
             index_slot: 0,
-            price: order.price,
             quantity,
             sequence: order.sequence,
             prev: NIL,
             next: NIL,
         };
-        self.rest_at_tail(order.side, resting);
+        self.rest_at_tail(order.side, order.price, resting);
     }
 
     /// Appends one already-validated resting order at the side tail and
     /// indexes it. Infallible for preflighted callers.
-    fn rest_at_tail(&mut self, side: Side, resting: RestingOrder) {
+    fn rest_at_tail(&mut self, side: Side, price: PriceTicks, resting: RestingOrder) {
         let Self {
             bids,
             asks,
@@ -1346,13 +1345,13 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Sell => (asks, ask_levels),
         };
         let descending = side == Side::Buy;
-        let level_index = if let Some(level_index) = sorted.find(resting.price, descending) {
+        let level_index = if let Some(level_index) = sorted.find(price, descending) {
             level_index
         } else {
             let level_index = sorted
-                .insert(resting.price, descending)
+                .insert(price, descending)
                 .expect("level capacity was preflighted");
-            levels[level_index] = Some(PriceLevel::new(resting.price));
+            levels[level_index] = Some(PriceLevel::new(price));
             level_index
         };
         let level = levels[level_index]
@@ -1464,6 +1463,13 @@ mod tests {
     use super::*;
     use hft_types::AccountId;
 
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn resting_slots_fit_in_fifty_six_bytes() {
+        assert_eq!(core::mem::size_of::<RestingOrder>(), 48);
+        assert_eq!(core::mem::size_of::<OrderSlot>(), 56);
+        assert_eq!(core::mem::size_of::<Option<PriceLevel<64>>>(), 3_624);
+    }
     fn order(id: u64, price: i64, quantity: u64, side: Side) -> NewOrder {
         NewOrder {
             time_in_force: hft_types::TimeInForce::Gtc,
