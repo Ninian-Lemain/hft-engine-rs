@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use core::num::NonZeroUsize;
 use hft_types::{AccountId, NewOrder, OrderId, PriceTicks, Quantity, RejectReason, Side};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,9 +90,9 @@ const NIL: usize = usize::MAX;
 const INDEX_PLANES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IndexSlot<V: Copy> {
+enum IndexSlot {
     Empty,
-    Occupied { key: u64, value: V },
+    Occupied { key: u64, value: NonZeroUsize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,17 +101,16 @@ enum ProbeError {
     Duplicate,
 }
 
-/// Fixed-capacity open-addressed `u64 -> V` index with linear probing and
-/// deterministic back-shift deletion. Values are stable storage handles;
-/// occupancy can never exceed half the slot capacity. The planes exist as a
-/// nested array because stable Rust cannot express `PLANE * PLANES` as one
-/// array length over const generics.
+/// Stored handles use `slot + 1` so zero encodes an empty entry. Keys keep
+/// their full range. `usize::MAX` remains the free-list terminator.
+/// Occupancy stays at or below half capacity. Nested planes avoid a const
+/// generic product in the array length.
 #[derive(Debug)]
-struct ProbeIndex<V: Copy, const PLANE: usize, const PLANES: usize> {
-    slots: [[IndexSlot<V>; PLANE]; PLANES],
+struct ProbeIndex<const PLANE: usize, const PLANES: usize> {
+    slots: [[IndexSlot; PLANE]; PLANES],
 }
 
-impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLANES> {
+impl<const PLANE: usize, const PLANES: usize> ProbeIndex<PLANE, PLANES> {
     const CAPACITY: usize = PLANE * PLANES;
 
     const fn new() -> Self {
@@ -125,12 +125,12 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
         (flat_index / PLANE, flat_index % PLANE)
     }
 
-    fn slot(&self, flat_index: usize) -> &IndexSlot<V> {
+    fn slot(&self, flat_index: usize) -> &IndexSlot {
         let (plane, within) = Self::coordinates(flat_index);
         &self.slots[plane][within]
     }
 
-    fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot<V> {
+    fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot {
         let (plane, within) = Self::coordinates(flat_index);
         &mut self.slots[plane][within]
     }
@@ -168,17 +168,21 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
         None
     }
 
-    fn lookup(&self, key: u64) -> Option<V> {
+    fn lookup(&self, key: u64) -> Option<usize> {
         match self.slot(self.find_slot(key)?) {
-            IndexSlot::Occupied { value, .. } => Some(*value),
+            IndexSlot::Occupied { value, .. } => Some(value.get() - 1),
             IndexSlot::Empty => None,
         }
     }
 
-    fn insert(&mut self, key: u64, value: V) -> Result<u32, ProbeError> {
+    fn insert(&mut self, key: u64, value: usize) -> Result<u32, ProbeError> {
         if Self::CAPACITY == 0 {
             return Err(ProbeError::Full);
         }
+        let value = value
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or(ProbeError::Full)?;
         let start = Self::probe_start(key);
         for offset in 0..Self::CAPACITY {
             let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
@@ -204,8 +208,8 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
         &mut self,
         flat_index: u32,
         key: u64,
-        mut update_moved: impl FnMut(u64, V, u32) -> bool,
-    ) -> Option<V> {
+        mut update_moved: impl FnMut(u64, usize, u32) -> bool,
+    ) -> Option<usize> {
         let flat_index = usize::try_from(flat_index).ok()?;
         if flat_index >= Self::CAPACITY {
             return None;
@@ -240,13 +244,13 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
                 let new_flat = u32::try_from(hole).expect("occupied slots fit u32");
                 // The closure must run in every profile; skipping it in
                 // release strands the moved value's stored handle.
-                let updated = update_moved(candidate_key, candidate_value, new_flat);
+                let updated = update_moved(candidate_key, candidate_value.get() - 1, new_flat);
                 debug_assert!(updated);
                 hole = candidate;
             }
             candidate = candidate.wrapping_add(1) % Self::CAPACITY;
         }
-        Some(value)
+        Some(value.get() - 1)
     }
 }
 
@@ -270,10 +274,10 @@ enum ReservationSlot {
 #[derive(Debug)]
 pub struct RiskEngine<const ACCOUNTS: usize, const ORDERS: usize> {
     accounts: [Option<AccountState>; ACCOUNTS],
-    account_index: ProbeIndex<usize, ACCOUNTS, INDEX_PLANES>,
+    account_index: ProbeIndex<ACCOUNTS, INDEX_PLANES>,
     reservations: [ReservationSlot; ORDERS],
     reservation_free_head: usize,
-    reservation_index: ProbeIndex<usize, ORDERS, INDEX_PLANES>,
+    reservation_index: ProbeIndex<ORDERS, INDEX_PLANES>,
     maximum_order_id: Option<OrderId>,
     killed: bool,
 }
@@ -1215,7 +1219,7 @@ mod tests {
                 risk.reservation_index.slot(flat),
                 &IndexSlot::Occupied {
                     key: reservation.order_id.0,
-                    value: slot_index,
+                    value: NonZeroUsize::new(slot_index + 1).expect("live slot is representable"),
                 },
                 "index slot points back at the reservation"
             );
@@ -1259,6 +1263,65 @@ mod tests {
             );
             assert_eq!(account.open_orders, open, "open orders equal live count");
         }
+    }
+
+    #[test]
+    fn index_slots_use_the_handle_niche_without_extra_storage() {
+        assert_eq!(
+            core::mem::size_of::<IndexSlot>(),
+            core::mem::size_of::<(u64, usize)>(),
+        );
+        assert!(core::mem::size_of::<IndexSlot>() < core::mem::size_of::<Option<(u64, usize)>>());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(core::mem::size_of::<IndexSlot>(), 16);
+            assert_eq!(core::mem::size_of::<Option<(u64, usize)>>(), 24);
+        }
+    }
+
+    #[test]
+    fn compact_handles_preserve_boundary_keys_and_back_shift_values() {
+        let mut index = ProbeIndex::<4, 2>::new();
+        let first = index.insert(0, 0).expect("first handle");
+        let second = index.insert(8, 3).expect("last storage handle");
+        let maximum = index
+            .insert(u64::MAX, usize::MAX - 1)
+            .expect("maximum encodable handle");
+        index
+            .insert(u64::MAX - 8, usize::MAX - 2)
+            .expect("colliding high handle");
+        assert_eq!(index.lookup(0), Some(0));
+        assert_eq!(index.lookup(8), Some(3));
+        assert_eq!(index.lookup(u64::MAX), Some(usize::MAX - 1));
+        assert_eq!(index.lookup(u64::MAX - 8), Some(usize::MAX - 2));
+
+        let before = index.slots;
+        assert_eq!(index.insert(1, usize::MAX), Err(ProbeError::Full));
+        assert_eq!(index.insert(0, 0), Err(ProbeError::Duplicate));
+        assert_eq!(index.slots, before, "rejected inserts do not mutate");
+
+        let mut moved = None;
+        assert_eq!(
+            index.remove_at(first, 0, |key, value, flat| {
+                moved = Some((key, value, flat));
+                true
+            }),
+            Some(0),
+        );
+        assert_eq!(moved, Some((8, 3, first)));
+        assert_eq!(index.lookup(0), None);
+        assert_eq!(index.lookup(8), Some(3));
+        assert_eq!(
+            index.remove_at(maximum, u64::MAX, |key, value, flat| {
+                moved = Some((key, value, flat));
+                true
+            }),
+            Some(usize::MAX - 1),
+        );
+        assert_eq!(moved, Some((u64::MAX - 8, usize::MAX - 2, maximum)));
+        assert_eq!(index.lookup(u64::MAX), None);
+        assert_eq!(index.lookup(u64::MAX - 8), Some(usize::MAX - 2));
+        assert_eq!(index.insert(0, 0), Ok(second), "empty slots can be reused");
     }
 
     #[test]
@@ -1384,7 +1447,7 @@ mod tests {
 
     #[test]
     fn index_handles_collisions_back_shift_and_slot_reuse() {
-        type TestIndex = ProbeIndex<usize, 4, INDEX_PLANES>;
+        type TestIndex = ProbeIndex<4, INDEX_PLANES>;
         let home = TestIndex::probe_start(1);
         let mut colliding = std::vec::Vec::new();
         let mut candidate = 1_u64;
