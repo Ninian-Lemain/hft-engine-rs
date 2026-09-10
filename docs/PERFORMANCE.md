@@ -4,6 +4,9 @@ This document records what the benchmark suite measures and how to interpret
 the results. Every timing currently published here is a Windows desktop smoke
 result. No qualified Linux latency result exists yet.
 
+The [layout measurements](LAYOUT.md) record the book and risk storage reductions
+and their paired desktop runs.
+
 ## What Is Measured
 
 `hft-bench` measures fixed in-memory operations and emits one JSON record per
