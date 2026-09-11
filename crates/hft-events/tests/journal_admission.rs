@@ -4,7 +4,11 @@ use hft_events::{
     BoundedEventEngine, CommandKind, Event, EventBatch, EventEngineError, EventId, Rejected,
 };
 use hft_gateway::{Gateway, GatewayError};
-use hft_journal::{JournalChannel, JournalError, JournalReader, RING_CAPACITY, ReadError};
+use hft_journal::{
+    DurableSink, FlushPolicy, JournalChannel, JournalError, JournalReader, PersistError,
+    PersistenceWorker, RECORD_SIZE, RING_CAPACITY, ReadError,
+};
+use hft_recovery::{encode_snapshot, recover_snapshot_and_tail};
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_spsc::SpscQueue;
 use hft_types::{
@@ -12,6 +16,7 @@ use hft_types::{
     RejectReason, SequenceNumber, Side, TimeInForce,
 };
 use hft_wire::{encode_cancel_order, encode_new_order};
+use std::{cell::RefCell, io, rc::Rc};
 
 type TestGateway = Gateway<1, 8, 4, 4>;
 type TestBatch = EventBatch<6>;
@@ -280,5 +285,127 @@ fn sequence_failures_happen_before_journal_enqueue() {
         assert_eq!(reader.expected_sequence(), expected);
         assert!(matches!(reader.read(), Err(ReadError::Empty)));
         assert!(consumer.try_pop().is_none());
+    }
+}
+
+struct Storage {
+    bytes: [u8; 2 * RECORD_SIZE],
+    written: usize,
+    durable: usize,
+    fail_flush: bool,
+}
+
+struct CrashSink(Rc<RefCell<Storage>>);
+
+impl DurableSink for CrashSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut storage = self.0.borrow_mut();
+        let start = storage.written;
+        let count = bytes.len().min(7).min(storage.bytes.len() - start);
+        storage.bytes[start..start + count].copy_from_slice(&bytes[..count]);
+        storage.written += count;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut storage = self.0.borrow_mut();
+        if storage.fail_flush {
+            return Err(io::ErrorKind::Other.into());
+        }
+        storage.durable = storage.written;
+        Ok(())
+    }
+}
+
+#[test]
+fn recovery_uses_the_durable_prefix_after_a_flush_failure() {
+    persistence_recovery(true);
+}
+
+#[test]
+fn clean_shutdown_makes_the_published_tail_recoverable() {
+    persistence_recovery(false);
+}
+
+fn persistence_recovery(fail_flush: bool) {
+    if hft_spsc::IS_LOOM_BUILD {
+        return;
+    }
+    let mut events = SpscQueue::<TestBatch, 1>::try_new().expect("event queue");
+    let (producer, mut consumer) = events.split();
+    let initial = gateway();
+    let snapshot = encode_snapshot(&initial, 0).expect("initial snapshot");
+    let mut engine = TestEngine::try_new(initial, producer).expect("event engine");
+    let mut journal = JournalChannel::try_new().expect("journal channel");
+    let (mut writer, reader) = journal.split(1);
+    let status = writer.status_reader().expect("controlled status");
+    let storage = Rc::new(RefCell::new(Storage {
+        bytes: [0; 2 * RECORD_SIZE],
+        written: 0,
+        durable: 0,
+        fail_flush: false,
+    }));
+    let mut worker = PersistenceWorker::<_, 1>::new(
+        reader,
+        CrashSink(Rc::clone(&storage)),
+        FlushPolicy::EveryBatch,
+    )
+    .expect("worker");
+
+    let mut durable_state = engine.gateway().export_state();
+    for sequence in 1..=2 {
+        let command = order(sequence, 2);
+        assert_eq!(writer.next_sequence(), sequence);
+        let admitted = engine.admit(Command::NewOrder(command)).expect("admission");
+        writer.enqueue(&encode_new_order(command)).expect("journal");
+        admitted.apply().expect("apply");
+        let batch = consumer.try_pop().expect("published batch");
+        assert!(matches!(batch.iter().next(), Some(Event::Accepted(_))));
+        assert_eq!(status.snapshot().next_durable_sequence, sequence);
+        assert_eq!(engine.gateway().expected_sequence().0, sequence + 1);
+
+        if sequence == 1 {
+            assert_eq!(worker.drain_batch().expect("first batch"), 1);
+            durable_state = engine.gateway().export_state();
+            assert_eq!(status.snapshot().next_durable_sequence, 2);
+        }
+    }
+    writer.close();
+    storage.borrow_mut().fail_flush = fail_flush;
+    if fail_flush {
+        assert!(matches!(worker.shutdown(), Err(PersistError::Io(_))));
+    } else {
+        worker.shutdown().expect("shutdown");
+        durable_state = engine.gateway().export_state();
+    }
+    let progress = status.snapshot();
+    assert_eq!(progress.next_written_sequence, 3);
+    assert_eq!(
+        progress.next_durable_sequence,
+        if fail_flush { 2 } else { 3 }
+    );
+    assert_eq!(progress.poisoned, fail_flush);
+    assert_eq!(progress.shutdown_complete, !fail_flush);
+    assert!(progress.producer_closed);
+    assert!(consumer.try_pop().is_none());
+
+    let stored = storage.borrow();
+    assert_eq!(stored.written, 2 * RECORD_SIZE);
+    assert_eq!(
+        stored.durable,
+        if fail_flush {
+            RECORD_SIZE
+        } else {
+            2 * RECORD_SIZE
+        }
+    );
+    let restored = recover_snapshot_and_tail::<1, 8, 4, 4, 4>(
+        snapshot.bytes(),
+        &stored.bytes[..stored.durable],
+    )
+    .expect("recover durable bytes");
+    assert_eq!(restored.export_state(), durable_state);
+    if fail_flush {
+        assert_ne!(restored.export_state(), engine.gateway().export_state());
     }
 }
