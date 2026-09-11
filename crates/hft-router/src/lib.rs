@@ -29,7 +29,8 @@ pub enum RouteTableError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteTable<const SHARDS: usize> {
     by_instrument: [InstrumentRoute; SHARDS],
-    by_shard: [InstrumentId; SHARDS],
+    by_shard: [u16; SHARDS],
+    dense: bool,
 }
 
 impl<const SHARDS: usize> RouteTable<SHARDS> {
@@ -51,7 +52,6 @@ impl<const SHARDS: usize> RouteTable<SHARDS> {
         }
 
         let mut seen_shards = [false; SHARDS];
-        let mut by_shard = [InstrumentId(0); SHARDS];
         for route in routes {
             let shard = usize::from(route.shard_id.0);
             if shard >= SHARDS {
@@ -61,7 +61,6 @@ impl<const SHARDS: usize> RouteTable<SHARDS> {
                 return Err(RouteTableError::DuplicateShardId(route.shard_id));
             }
             seen_shards[shard] = true;
-            by_shard[shard] = route.instrument_id;
         }
 
         routes.sort_unstable_by_key(|route| route.instrument_id);
@@ -70,15 +69,32 @@ impl<const SHARDS: usize> RouteTable<SHARDS> {
                 return Err(RouteTableError::DuplicateInstrument(pair[0].instrument_id));
             }
         }
+        let mut by_shard = [0; SHARDS];
+        for (index, route) in routes.iter().enumerate() {
+            by_shard[usize::from(route.shard_id.0)] =
+                u16::try_from(index).map_err(|_| RouteTableError::TooManyShards)?;
+        }
+        let dense = routes[SHARDS - 1].instrument_id.0 - routes[0].instrument_id.0
+            == u32::try_from(SHARDS - 1).map_err(|_| RouteTableError::TooManyShards)?;
 
         Ok(Self {
             by_instrument: routes,
             by_shard,
+            dense,
         })
     }
 
     #[must_use]
     pub fn shard_for(&self, instrument_id: InstrumentId) -> Option<ShardId> {
+        if self.dense {
+            let offset = instrument_id
+                .0
+                .checked_sub(self.by_instrument[0].instrument_id.0)?;
+            return self
+                .by_instrument
+                .get(usize::try_from(offset).ok()?)
+                .map(|route| route.shard_id);
+        }
         self.by_instrument
             .binary_search_by_key(&instrument_id, |route| route.instrument_id)
             .ok()
@@ -87,7 +103,10 @@ impl<const SHARDS: usize> RouteTable<SHARDS> {
 
     #[must_use]
     pub fn instrument_for(&self, shard_id: ShardId) -> Option<InstrumentId> {
-        self.by_shard.get(usize::from(shard_id.0)).copied()
+        let index = *self.by_shard.get(usize::from(shard_id.0))?;
+        self.by_instrument
+            .get(usize::from(index))
+            .map(|route| route.instrument_id)
     }
 
     #[must_use]
@@ -445,6 +464,136 @@ mod tests {
             ]),
             Err(RouteTableError::InvalidShardId(ShardId(2)))
         );
+    }
+
+    #[test]
+    fn dense_routes_resolve_offsets_without_changing_canonical_order() {
+        let routes = [
+            InstrumentRoute {
+                instrument_id: InstrumentId(103),
+                shard_id: ShardId(0),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(100),
+                shard_id: ShardId(2),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(102),
+                shard_id: ShardId(1),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(101),
+                shard_id: ShardId(3),
+            },
+        ];
+        let table = RouteTable::try_new(routes).expect("dense routes");
+        for route in routes {
+            assert_eq!(table.shard_for(route.instrument_id), Some(route.shard_id));
+            assert_eq!(
+                table.instrument_for(route.shard_id),
+                Some(route.instrument_id)
+            );
+        }
+        assert_eq!(table.shard_for(InstrumentId(99)), None);
+        assert_eq!(table.shard_for(InstrumentId(104)), None);
+        assert_eq!(
+            table.routes().map(|route| route.instrument_id),
+            [
+                InstrumentId(100),
+                InstrumentId(101),
+                InstrumentId(102),
+                InstrumentId(103)
+            ]
+        );
+    }
+
+    #[test]
+    fn sparse_routes_search_displaced_ids_and_reject_holes() {
+        let routes = [
+            InstrumentRoute {
+                instrument_id: InstrumentId(10),
+                shard_id: ShardId(2),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(11),
+                shard_id: ShardId(4),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(13),
+                shard_id: ShardId(1),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(900),
+                shard_id: ShardId(0),
+            },
+            InstrumentRoute {
+                instrument_id: InstrumentId(u32::MAX),
+                shard_id: ShardId(3),
+            },
+        ];
+        let table = RouteTable::try_new(routes).expect("sparse routes");
+        for id in (0..=1_000).chain([u32::MAX - 1, u32::MAX]) {
+            let expected = routes
+                .iter()
+                .find(|route| route.instrument_id.0 == id)
+                .map(|route| route.shard_id);
+            assert_eq!(table.shard_for(InstrumentId(id)), expected);
+        }
+        for route in routes {
+            assert_eq!(
+                table.instrument_for(route.shard_id),
+                Some(route.instrument_id)
+            );
+        }
+    }
+
+    #[test]
+    fn dense_routes_preserve_instrument_id_boundaries() {
+        for start in [0, u32::MAX - 2] {
+            let table =
+                RouteTable::try_new(std::array::from_fn::<_, 3, _>(|index| InstrumentRoute {
+                    instrument_id: InstrumentId(start + u32::try_from(index).expect("index")),
+                    shard_id: ShardId(u16::try_from(2 - index).expect("shard")),
+                }))
+                .expect("boundary routes");
+            for index in 0_u16..3 {
+                let instrument_id = InstrumentId(start + u32::from(index));
+                let shard_id = ShardId(2 - index);
+                assert_eq!(table.shard_for(instrument_id), Some(shard_id));
+                assert_eq!(table.instrument_for(shard_id), Some(instrument_id));
+            }
+            assert_eq!(table.shard_for(InstrumentId(start.wrapping_sub(1))), None);
+            assert_eq!(table.shard_for(InstrumentId(start.wrapping_add(3))), None);
+        }
+    }
+
+    #[test]
+    fn reverse_route_index_covers_every_shard_id() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                const SHARDS: usize = 65_536;
+                let routes = std::array::from_fn::<_, SHARDS, _>(|index| InstrumentRoute {
+                    instrument_id: InstrumentId(u32::MAX - u32::try_from(index).expect("index")),
+                    shard_id: ShardId(u16::try_from(index).expect("shard")),
+                });
+                let table = RouteTable::try_new(routes).expect("maximum shard count");
+                for shard in 0..=u16::MAX {
+                    let instrument_id = InstrumentId(u32::MAX - u32::from(shard));
+                    assert_eq!(table.instrument_for(ShardId(shard)), Some(instrument_id));
+                    assert_eq!(table.shard_for(instrument_id), Some(ShardId(shard)));
+                }
+            })
+            .expect("test thread")
+            .join()
+            .expect("maximum shard count test");
+    }
+
+    #[test]
+    fn reverse_route_index_uses_two_bytes_per_shard() {
+        assert_eq!(core::mem::size_of::<RouteTable<4>>(), 44);
+        assert_eq!(core::mem::size_of::<RouteTable<64>>(), 644);
+        assert_eq!(core::mem::size_of::<RouteTable<1024>>(), 10_244);
     }
 
     #[test]
