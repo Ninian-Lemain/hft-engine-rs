@@ -103,11 +103,7 @@ impl Command {
 const _: () = assert!(core::mem::size_of::<CancelOrder>() == 24);
 const _: () = assert!(core::mem::align_of::<CancelOrder>() == 8);
 
-const _: () = assert!(
-    core::mem::size_of::<NewOrder>() == NEW_ORDER_SIZE,
-    "neworder layout"
-);
-const NEW_ORDER_SIZE: usize = core::mem::size_of::<NewOrder>();
+const _: () = assert!(core::mem::size_of::<NewOrder>() == 48);
 const _: () = assert!(core::mem::align_of::<NewOrder>() == 8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
