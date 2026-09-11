@@ -158,6 +158,22 @@ keeps a capacity-one ring full and retries the same next command.
 These cells measure an in-process SPSC handoff. They do not include event wire
 encoding, network publication, storage, or a second process.
 
+Event admission token commit `1cebd63` was compared with the `c3d5efd` layout
+baseline on the same AMD Windows host. Ten paired runs used 2,000 samples per
+cell. The second five pairs reversed run order. All 103 cells retained their
+checksums and allocation counts. The following values are medians of per-run
+means. [Raw results](evidence/admission-2026-09-11.zip) include binary hashes.
+
+| Workload | Before | After | Before range | After range |
+| --- | ---: | ---: | --- | --- |
+| Accepted command and batch pop | 107 ns | 108 ns | 103 to 116 ns | 105 to 118 ns |
+| Full event ring refusal | 38 ns | 37 ns | 36 to 41 ns | 36 to 40 ns |
+| Route, process, retrieve event | 106 ns | 109 ns | 102 to 123 ns | 106 to 113 ns |
+
+The routed cell exercises normalized-command admission. The event cells use
+the unchanged frame path. The ranges overlap. These runs do not establish a
+latency improvement or a dedicated Linux result.
+
 ## Multi-Instrument Routing
 
 The v0.19 router run used two instruments, two shards, 64 command slots per
