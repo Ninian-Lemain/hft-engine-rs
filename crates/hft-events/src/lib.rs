@@ -173,6 +173,35 @@ pub struct BoundedEventEngine<
     producer: Producer<'queue, EventBatch<BATCH>, QUEUE>,
 }
 
+/// One command with checked sequence and event capacity.
+///
+/// The token holds the exclusive engine borrow. Dropping it leaves gateway
+/// state and the event queue unchanged.
+#[must_use]
+pub struct AdmittedCommand<
+    'engine,
+    'queue,
+    const ACCOUNTS: usize,
+    const RISK_ORDERS: usize,
+    const LEVELS: usize,
+    const ORDERS_PER_LEVEL: usize,
+    const REPORTS: usize,
+    const BATCH: usize,
+    const QUEUE: usize,
+> {
+    engine: &'engine mut BoundedEventEngine<
+        'queue,
+        ACCOUNTS,
+        RISK_ORDERS,
+        LEVELS,
+        ORDERS_PER_LEVEL,
+        REPORTS,
+        BATCH,
+        QUEUE,
+    >,
+    command: Command,
+}
+
 impl<
     'queue,
     const ACCOUNTS: usize,
@@ -253,8 +282,45 @@ impl<
     /// Uses the same sequence, capacity, gateway, and publication errors as
     /// [`Self::process_frame`].
     pub fn process_command(&mut self, command: Command) -> Result<(), EventEngineError> {
+        self.admit(command)?.apply()
+    }
+
+    /// Checks sequence and event capacity without applying the command.
+    ///
+    /// The returned token keeps one event slot available until application.
+    /// Dropping it leaves gateway state and the event queue unchanged.
+    /// Risk and book checks run only when the token is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sequence error before checking event capacity. A full queue
+    /// returns [`EventEngineError::Backpressured`].
+    pub fn admit(
+        &mut self,
+        command: Command,
+    ) -> Result<
+        AdmittedCommand<
+            '_,
+            'queue,
+            ACCOUNTS,
+            RISK_ORDERS,
+            LEVELS,
+            ORDERS_PER_LEVEL,
+            REPORTS,
+            BATCH,
+            QUEUE,
+        >,
+        EventEngineError,
+    > {
+        self.preflight(command.sequence())?;
+        Ok(AdmittedCommand {
+            engine: self,
+            command,
+        })
+    }
+
+    fn apply_admitted_command(&mut self, command: Command) -> Result<(), EventEngineError> {
         let sequence = command.sequence();
-        self.preflight(sequence)?;
         let identity = CommandIdentity::from_command(command);
         let before = (
             self.gateway.top_level(Side::Buy),
@@ -363,6 +429,30 @@ impl<
     #[must_use]
     pub fn into_gateway(self) -> Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL> {
         self.gateway
+    }
+}
+
+impl<
+    const ACCOUNTS: usize,
+    const RISK_ORDERS: usize,
+    const LEVELS: usize,
+    const ORDERS_PER_LEVEL: usize,
+    const REPORTS: usize,
+    const BATCH: usize,
+    const QUEUE: usize,
+> AdmittedCommand<'_, '_, ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL, REPORTS, BATCH, QUEUE>
+{
+    /// Applies the admitted command and publishes its complete event batch.
+    ///
+    /// Sequence-valid business rejections publish a rejection event and
+    /// return success.
+    ///
+    /// # Errors
+    ///
+    /// Returns fatal gateway or event publication errors. These failures can
+    /// occur after mutation and must not be retried.
+    pub fn apply(self) -> Result<(), EventEngineError> {
+        self.engine.apply_admitted_command(self.command)
     }
 }
 
@@ -527,6 +617,12 @@ mod tests {
             side,
             time_in_force: TimeInForce::Gtc,
         })
+    }
+
+    fn command(frame: &[u8]) -> Command {
+        parse_message(&RxFrame::from_bytes(frame))
+            .expect("command frame")
+            .to_command()
     }
 
     #[test]
@@ -770,6 +866,149 @@ mod tests {
             .expect("retry");
         assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(3));
         assert!(consumer.try_pop().is_some());
+    }
+
+    #[test]
+    fn dropped_admission_preserves_state_and_can_be_retried() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(gateway(), producer)
+            .expect("batch capacity");
+        let new_order = command(&order(1, 1, 1, Side::Buy, 99, 2));
+        let before = engine.gateway().export_state();
+
+        {
+            let _admitted = engine.admit(new_order).expect("admit command");
+            assert!(consumer.try_pop().is_none());
+        }
+
+        assert_eq!(engine.gateway().export_state(), before);
+        assert!(consumer.try_pop().is_none());
+        engine
+            .admit(new_order)
+            .expect("retry admission")
+            .apply()
+            .expect("apply command");
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(2));
+        let batch = consumer.try_pop().expect("command batch");
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(
+            batch.iter().next(),
+            Some(Event::Accepted(Accepted {
+                id: EventId {
+                    command_sequence: SequenceNumber(1),
+                    ordinal: 0,
+                },
+                order_id: OrderId(1),
+                resting_quantity: Quantity(2),
+                ..
+            }))
+        ));
+        assert!(consumer.try_pop().is_none());
+    }
+
+    #[test]
+    fn admission_checks_sequence_then_capacity_before_mutation() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(gateway(), producer)
+            .expect("batch capacity");
+        engine
+            .process_command(command(&order(1, 1, 1, Side::Buy, 99, 2)))
+            .expect("first command");
+        let before = engine.gateway().export_state();
+
+        let gap = command(&order(2, 1, 3, Side::Buy, 98, 2));
+        assert!(matches!(
+            engine.admit(gap),
+            Err(EventEngineError::Gateway(GatewayError::Sequence {
+                expected: SequenceNumber(2),
+                received: SequenceNumber(3),
+            }))
+        ));
+        let second = command(&order(2, 1, 2, Side::Buy, 98, 2));
+        assert!(matches!(
+            engine.admit(second),
+            Err(EventEngineError::Backpressured)
+        ));
+        assert_eq!(engine.gateway().export_state(), before);
+
+        let _ = consumer.try_pop().expect("first command batch");
+        assert!(consumer.try_pop().is_none());
+        engine
+            .admit(second)
+            .expect("admit after reclaim")
+            .apply()
+            .expect("second command");
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(3));
+        assert!(consumer.try_pop().is_some());
+        assert!(consumer.try_pop().is_none());
+    }
+
+    #[test]
+    fn admission_checks_sequence_exhaustion_before_capacity() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut state = gateway().export_state();
+        state.expected_sequence = SequenceNumber(u64::MAX);
+        let exhausted = Gateway::from_state(&state).expect("boundary state");
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (mut producer, mut consumer) = queue.split();
+        producer.try_push(TestBatch::new()).expect("fill queue");
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(exhausted, producer)
+            .expect("batch capacity");
+        let last = command(&order(1, 1, u64::MAX, Side::Buy, 100, 1));
+
+        assert!(matches!(
+            engine.admit(last),
+            Err(EventEngineError::Gateway(GatewayError::RiskState(
+                RejectReason::ArithmeticOverflow
+            )))
+        ));
+        assert_eq!(engine.gateway().export_state(), state);
+        assert_eq!(consumer.try_pop(), Some(TestBatch::new()));
+        assert!(consumer.try_pop().is_none());
+    }
+
+    #[test]
+    fn admitted_business_rejection_is_published_only_when_applied() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(gateway(), producer)
+            .expect("batch capacity");
+        let oversized = command(&order(7, 2, 1, Side::Buy, 100, 101));
+        let admitted = engine.admit(oversized).expect("admit command");
+        assert!(consumer.try_pop().is_none());
+        admitted.apply().expect("publish business rejection");
+
+        let batch = consumer.try_pop().expect("rejection batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch.iter().next(),
+            Some(&Event::Rejected(Rejected {
+                id: EventId {
+                    command_sequence: SequenceNumber(1),
+                    ordinal: 0,
+                },
+                command: CommandKind::NewOrder,
+                order_id: OrderId(7),
+                account_id: AccountId(2),
+                instrument_id: InstrumentId(7),
+                reason: RejectReason::QuantityLimit,
+            }))
+        );
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(2));
+        assert!(consumer.try_pop().is_none());
     }
 
     #[test]
