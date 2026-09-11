@@ -32,6 +32,9 @@
 - An order book has one writer and no shared mutable access.
 - Each book owns its open-addressed order index. Index slots use deterministic
   linear probing, remain at or below 50% live load, and never grow on the heap.
+- The sorted price directory is contiguous. FIFO slots keep stable handles
+  when another price is inserted or removed. Each level maintains its quantity
+  total, so top-of-book publication does not walk its orders.
 - `SpscQueue::split` requires an exclusive queue borrow and yields exactly one
   producer and consumer.
 - One event producer owns gateway admission. A full event queue is detected

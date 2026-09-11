@@ -45,3 +45,35 @@ The range covers the lowest and highest per-run mean.
 
 Some cells regress and others improve. Dedicated Linux measurements must
 resolve the timing changes before performance qualification.
+
+## Book totals and route lookup
+
+The 2026-09-12 build stores an order location as a nonzero flat handle. It
+encodes the side, level, and FIFO slot. Zero marks an empty index entry.
+Order IDs still use all 64 bits.
+
+Each price level maintains a `u128` quantity total. Insert, partial fill,
+unlink, and replacement update it. Restore rebuilds it from logical orders.
+This adds 24 bytes per level on this target, including alignment. The smaller
+order index more than offsets that cost for the measured shapes.
+
+| Type | Before bytes | After bytes |
+| --- | ---: | ---: |
+| Book order index entry | 32 | 16 |
+| `OrderBook<1,8>` | 2,088 | 1,632 |
+| `OrderBook<1,64>` | 15,528 | 11,488 |
+| `OrderBook<1,512>` | 123,048 | 90,336 |
+| `RouteTable<64>` | 768 | 644 |
+| `RouteTable<1024>` | 12,288 | 10,244 |
+
+The route table stores reverse indexes as `u16` instead of duplicate instrument
+IDs. A construction-time flag selects direct offsets for contiguous IDs and
+binary search for sparse IDs. Reverse lookup adds an indexed read. Full
+instrument IDs and all 65,536 shard IDs remain supported.
+
+The sorted price directory stays contiguous. Order slots do not move when
+prices are inserted or removed. Matching adds no heap allocation or logging.
+Wire, journal, snapshot, and C layouts are unchanged.
+
+[Measurements](PERFORMANCE.md#book-totals-and-direct-routing) include update
+costs and sparse lookup regressions.

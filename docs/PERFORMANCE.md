@@ -273,6 +273,46 @@ The reproducible suite later added alternating new-order and cancel parsing, a
 20,000-command seeded gateway mix, and deep-book takers that cross 1, 8, or 64
 levels. Each cell records a checksum and asserts the expected work.
 
+## Book Totals and Direct Routing
+
+Ten paired full-suite runs on 2026-09-12 used the same AMD Windows host and
+Rust 1.96.0 release settings. Both processes used logical CPU 2 with affinity
+mask `0x4`. That CPU was not isolated. The second five pairs reversed run order.
+The baseline was `011ca7b` with benchmark changes from `1dca1b5`. The final
+candidate was `795908a`.
+
+Values below are medians of ten per-run means. Book reads inspect both sides.
+The cycle submits one order, reads both sides, cancels it, and reads again.
+Lookup samples contain 64 calls and report time per call.
+
+| Workload | Before ns | After ns |
+| --- | ---: | ---: |
+| Best-level pair, 8 orders per side | 55 | 37 |
+| Best-level pair, 64 orders per side | 334.5 | 37 |
+| Best-level pair, 512 orders per side | 5,948.5 | 37 |
+| Submit/read/cancel/read, depth 64 | 1,779.5 | 108 |
+| Route, process, retrieve event | 179.5 | 164 |
+| Dense route hit, 64 instruments | 4 | 1.5 |
+| Dense route hit, 1,024 instruments | 8.5 | 3.5 |
+| Sparse route hit, 64 instruments | 6.5 | 8 |
+| Sparse route hit, 1,024 instruments | 12.5 | 17 |
+| Reverse lookup, 1,024 instruments | 1 | 1.5 |
+
+Cached level totals remove FIFO walks from event publication. Sparse lookup
+still performs binary search after testing the table's fixed lookup mode.
+Reverse lookup trades one array read for smaller storage. These results do
+not show a universal speedup. Route/process/event means ranged from 122 to
+377 ns before and 126 to 498 ns after. Dedicated Linux runs must resolve
+sparse lookup costs and end-to-end latency before qualification.
+
+All 124 cells matched checksums, sample counts, allocation counts, and
+parameters other than measured structure sizes. Hot cells allocated nothing.
+Recovery cells retain their cold-path allocations. All four retained soak
+seeds passed one million declared steps with the final build.
+[Raw evidence](evidence/cache-2026-09-12.zip) includes both the initial
+unpinned experiment and the final pinned comparison. The initial speculative
+route probe was replaced with construction-time strategy selection.
+
 ## Order Policies and Replace
 
 All values below are Windows desktop smoke means.
@@ -288,12 +328,17 @@ All values below are Windows desktop smoke means.
 | Replace | reduce in place | 48 ns |
 | Replace | increase | 93 ns |
 | Replace | reprice | 89 ns |
-| Replace | unknown order rejection | 86 ns |
+| Replace | unknown order rejection | Withdrawn |
 | Risk | reservation adjustment | 56 ns |
 
 IOC never rests its remainder. FOK preflights full execution before mutation.
 Post-only checks crossing without walking all levels. Replace reductions keep
 priority. Increases and price changes remove and reinsert the order.
+
+The former 86 ns unknown-order result measured a successful replacement.
+That fixture now uses a missing ID. Replacement fixtures now run warmup and
+check allocation counters around the operation. Earlier replacement results
+did not have those checks.
 
 ## SPSC
 
