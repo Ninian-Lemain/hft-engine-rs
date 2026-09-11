@@ -7,7 +7,7 @@ use hft_types::SequenceNumber;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const MAX_PAYLOAD: usize = 46;
 pub const RECORD_SIZE: usize = 64;
@@ -180,10 +180,113 @@ pub enum DecodeError {
     ChecksumMismatch { sequence: SequenceNumber },
 }
 
-/// Journal queue with an explicit producer-close signal.
+/// Watermarks start at the channel's first sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalStatus {
+    /// First sequence not covered by a fully written batch.
+    pub next_written_sequence: u64,
+    /// First sequence not covered by a successful flush.
+    pub next_durable_sequence: u64,
+    pub producer_closed: bool,
+    pub poisoned: bool,
+    pub shutdown_complete: bool,
+}
+
+#[derive(Debug)]
+struct StatusState {
+    next_written_sequence: AtomicU64,
+    next_durable_sequence: AtomicU64,
+    producer_closed: AtomicBool,
+    poisoned: AtomicBool,
+    shutdown_complete: AtomicBool,
+}
+
+impl StatusState {
+    fn new(first_sequence: u64) -> Self {
+        Self {
+            next_written_sequence: AtomicU64::new(first_sequence),
+            next_durable_sequence: AtomicU64::new(first_sequence),
+            producer_closed: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Read-only persistence progress for a controlled journal channel.
+#[derive(Clone, Copy, Debug)]
+pub struct JournalStatusReader<'queue> {
+    state: &'queue StatusState,
+}
+
+impl JournalStatusReader<'_> {
+    /// Counters may advance during this call. Durable never exceeds written.
+    #[must_use]
+    pub fn snapshot(&self) -> JournalStatus {
+        // Completion publishes the final counters and producer closure. Read
+        // durable before written to include the batch that its flush covered.
+        let shutdown_complete = self.state.shutdown_complete.load(Ordering::Acquire);
+        let next_durable_sequence = self.state.next_durable_sequence.load(Ordering::Acquire);
+        let next_written_sequence = self.state.next_written_sequence.load(Ordering::Acquire);
+        JournalStatus {
+            next_written_sequence,
+            next_durable_sequence,
+            producer_closed: self.state.producer_closed.load(Ordering::Acquire),
+            poisoned: self.state.poisoned.load(Ordering::Acquire),
+            shutdown_complete,
+        }
+    }
+}
+
+struct StatusGuard<'queue> {
+    state: Option<&'queue StatusState>,
+    shutdown_complete: bool,
+}
+
+impl StatusGuard<'_> {
+    fn poison(&self) {
+        if let Some(state) = self.state {
+            state.poisoned.store(true, Ordering::Release);
+        }
+    }
+
+    fn publish_written(&self, next_sequence: u64) {
+        if let Some(state) = self.state {
+            state
+                .next_written_sequence
+                .store(next_sequence, Ordering::Release);
+        }
+    }
+
+    fn publish_durable(&self, next_sequence: u64) {
+        if let Some(state) = self.state {
+            // The written watermark precedes this successful flush publication.
+            state
+                .next_durable_sequence
+                .store(next_sequence, Ordering::Release);
+        }
+    }
+
+    fn complete(&mut self) {
+        if let Some(state) = self.state {
+            state.shutdown_complete.store(true, Ordering::Release);
+        }
+        self.shutdown_complete = true;
+    }
+}
+
+impl Drop for StatusGuard<'_> {
+    fn drop(&mut self) {
+        if !self.shutdown_complete {
+            self.poison();
+        }
+    }
+}
+
+/// Journal queue with producer closure and persistence progress.
 pub struct JournalChannel {
     queue: SpscQueue<JournalRecord, RING_CAPACITY>,
-    producer_closed: AtomicBool,
+    status: StatusState,
 }
 
 impl JournalChannel {
@@ -193,21 +296,18 @@ impl JournalChannel {
     pub fn try_new() -> Result<Self, QueueConfigError> {
         Ok(Self {
             queue: SpscQueue::try_new()?,
-            producer_closed: AtomicBool::new(false),
+            status: StatusState::new(0),
         })
     }
 
     /// Creates the single writer and reader for one sequence domain.
     pub fn split(&mut self, first_sequence: u64) -> (JournalWriter<'_>, JournalReader<'_>) {
-        let Self {
-            queue,
-            producer_closed,
-        } = self;
-        producer_closed.store(false, Ordering::Relaxed);
+        let Self { queue, status } = self;
+        *status = StatusState::new(first_sequence);
         let (producer, consumer) = queue.split();
         (
-            JournalWriter::controlled(producer, first_sequence, producer_closed),
-            JournalReader::controlled(consumer, first_sequence, producer_closed),
+            JournalWriter::controlled(producer, first_sequence, status),
+            JournalReader::controlled(consumer, first_sequence, status),
         )
     }
 }
@@ -215,7 +315,7 @@ impl JournalChannel {
 pub struct JournalWriter<'queue> {
     producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
     next_sequence: u64,
-    producer_closed: Option<&'queue AtomicBool>,
+    status: Option<&'queue StatusState>,
 }
 
 impl<'queue> JournalWriter<'queue> {
@@ -227,19 +327,19 @@ impl<'queue> JournalWriter<'queue> {
         Self {
             producer,
             next_sequence: first_sequence,
-            producer_closed: None,
+            status: None,
         }
     }
 
     fn controlled(
         producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
         first_sequence: u64,
-        producer_closed: &'queue AtomicBool,
+        status: &'queue StatusState,
     ) -> Self {
         Self {
             producer,
             next_sequence: first_sequence,
-            producer_closed: Some(producer_closed),
+            status: Some(status),
         }
     }
 
@@ -257,14 +357,20 @@ impl<'queue> JournalWriter<'queue> {
         self.next_sequence
     }
 
+    /// Raw SPSC constructors have no persistence status.
+    #[must_use]
+    pub fn status_reader(&self) -> Option<JournalStatusReader<'queue>> {
+        self.status.map(|state| JournalStatusReader { state })
+    }
+
     /// Closes admission for a controlled journal channel.
     ///
     /// Raw SPSC constructors do not carry a close signal.
     pub fn close(self) {
-        if let Some(producer_closed) = self.producer_closed {
+        if let Some(status) = self.status {
             // Release follows every enqueue. Close consumes the only writer,
             // so an acquiring worker cannot miss a later publication.
-            producer_closed.store(true, Ordering::Release);
+            status.producer_closed.store(true, Ordering::Release);
         }
     }
 
@@ -320,7 +426,7 @@ pub struct JournalReader<'queue> {
     consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
     expected_sequence: u64,
     poisoned: bool,
-    producer_closed: Option<&'queue AtomicBool>,
+    status: StatusGuard<'queue>,
 }
 
 impl<'queue> JournalReader<'queue> {
@@ -333,20 +439,26 @@ impl<'queue> JournalReader<'queue> {
             consumer,
             expected_sequence: first_expected,
             poisoned: false,
-            producer_closed: None,
+            status: StatusGuard {
+                state: None,
+                shutdown_complete: false,
+            },
         }
     }
 
     fn controlled(
         consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
         first_expected: u64,
-        producer_closed: &'queue AtomicBool,
+        status: &'queue StatusState,
     ) -> Self {
         Self {
             consumer,
             expected_sequence: first_expected,
             poisoned: false,
-            producer_closed: Some(producer_closed),
+            status: StatusGuard {
+                state: Some(status),
+                shutdown_complete: false,
+            },
         }
     }
     #[must_use]
@@ -370,12 +482,14 @@ impl<'queue> JournalReader<'queue> {
         let record = self.consumer.try_pop().ok_or(ReadError::Empty)?;
         if !record.verify() {
             self.poisoned = true;
+            self.status.poison();
             return Err(ReadError::ChecksumMismatch {
                 sequence: record.sequence,
             });
         }
         if record.sequence.0 != self.expected_sequence {
             self.poisoned = true;
+            self.status.poison();
             return Err(ReadError::SequenceMismatch {
                 expected: SequenceNumber(self.expected_sequence),
                 received: record.sequence,
@@ -383,6 +497,7 @@ impl<'queue> JournalReader<'queue> {
         }
         self.expected_sequence = self.expected_sequence.checked_add(1).ok_or_else(|| {
             self.poisoned = true;
+            self.status.poison();
             ReadError::Poisoned
         })?;
         Ok(ParsedRecord(record))
@@ -397,8 +512,9 @@ impl<'queue> JournalReader<'queue> {
     }
 
     fn producer_is_closed(&self) -> bool {
-        self.producer_closed
-            .is_some_and(|closed| closed.load(Ordering::Acquire))
+        self.status
+            .state
+            .is_some_and(|state| state.producer_closed.load(Ordering::Acquire))
     }
 }
 
@@ -453,12 +569,22 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
     ///
     /// # Errors
     ///
-    /// Returns `InvalidInput` when `BATCH` is zero.
+    /// Returns `InvalidInput` when `BATCH` is zero or a controlled reader has
+    /// consumed or rejected records. Refusal poisons a controlled channel.
     pub fn new(reader: JournalReader<'queue>, sink: S, policy: FlushPolicy) -> io::Result<Self> {
         if BATCH == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "journal batch must be nonzero",
+            ));
+        }
+        if reader.status.state.is_some_and(|state| {
+            reader.poisoned
+                || reader.expected_sequence != state.next_written_sequence.load(Ordering::Acquire)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal reader consumed records before persistence",
             ));
         }
         Ok(Self {
@@ -494,10 +620,18 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
                 return self.fail(PersistError::Io(error));
             }
         }
+        if count != 0 {
+            self.reader
+                .status
+                .publish_written(self.reader.expected_sequence);
+        }
         if count != 0 && self.policy == FlushPolicy::EveryBatch {
             if let Err(error) = self.sink.flush() {
                 return self.fail(PersistError::Io(error));
             }
+            self.reader
+                .status
+                .publish_durable(self.reader.expected_sequence);
         }
         Ok(count)
     }
@@ -511,6 +645,9 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
         if self.poisoned {
             return Err(PersistError::Poisoned);
         }
+        if self.reader.status.shutdown_complete {
+            return Ok(());
+        }
         if !self.reader.producer_is_closed() {
             return Err(PersistError::ProducerOpen);
         }
@@ -522,9 +659,14 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
         if let Err(error) = self.sink.flush() {
             return self.fail(PersistError::Io(error));
         }
+        self.reader
+            .status
+            .publish_durable(self.reader.expected_sequence);
+        self.reader.status.complete();
         Ok(())
     }
     /// Returns the sink only when no terminal error occurred.
+    /// Taking a controlled sink before shutdown marks its status poisoned.
     ///
     /// # Errors
     ///
@@ -538,6 +680,7 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
     }
     fn fail<T>(&mut self, error: PersistError) -> Result<T, PersistError> {
         self.poisoned = true;
+        self.reader.status.poison();
         Err(error)
     }
 }
