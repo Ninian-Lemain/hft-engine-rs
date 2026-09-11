@@ -160,9 +160,9 @@ encoding, network publication, storage, or a second process.
 
 Event admission token commit `1cebd63` was compared with the `c3d5efd` layout
 baseline on the same AMD Windows host. Ten paired runs used 2,000 samples per
-cell. The second five pairs reversed run order. All 103 cells retained their
-checksums and allocation counts. The following values are medians of per-run
-means. [Raw results](evidence/admission-2026-09-11.zip) include binary hashes.
+event or router cell. The second five pairs reversed run order. All 103 cells
+retained their checksums and allocation counts. Values below are medians of
+per-run means. [Raw results](evidence/admission-2026-09-11.zip) include binary hashes.
 
 | Workload | Before | After | Before range | After range |
 | --- | ---: | ---: | --- | --- |
@@ -352,6 +352,29 @@ verification, encoding, batching, and sink copies. They do not measure disk or
 flush latency. No filesystem timing is published. File recovery, short writes,
 flush failures, corrupt tails, truncated tails, duplicates, and gaps are
 correctness fixtures only.
+
+Ten paired runs on 2026-09-11 compared controlled journal channels before and
+after shared persistence status. The baseline was `1acb481` with the same
+benchmark workloads as candidate `658704a`. Values below are medians of ten
+per-run means on the same AMD Windows host.
+
+| Controlled channel cell | Before | After |
+| --- | ---: | ---: |
+| Enqueue | 52 ns | 50.5 ns |
+| Batch 1, every-batch flush | 73 ns/record | 70.5 ns/record |
+| Batch 1, shutdown flush | 73 ns/record | 68 ns/record |
+| Batch 8, every-batch flush | 33.5 ns/record | 34 ns/record |
+| Batch 8, shutdown flush | 33.5 ns/record | 34 ns/record |
+| Batch 32, every-batch flush | 33 ns/record | 32 ns/record |
+| Batch 32, shutdown flush | 33 ns/record | 31 ns/record |
+
+All 110 cells matched parameters, sample counts, checksums and allocation
+counts in each pair. The controlled journal cells allocated nothing. Baseline
+enqueue means ranged from 49 to 1,460 ns, compared with 48 to 68 ns after.
+These mixed desktop results do not establish a speedup. The sink was memory,
+so flush timing does not represent storage durability latency.
+[Raw results](evidence/journal-status-2026-09-11.zip) include sample budgets,
+build details and binary hashes.
 
 ## Report Buffer Storage
 
