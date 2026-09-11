@@ -37,6 +37,7 @@
     "algorithm",
     "cpu_crc",
     "batch",
+    "flush_policy",
     "state_bytes",
     "snapshot_bytes",
     "tail_bytes",

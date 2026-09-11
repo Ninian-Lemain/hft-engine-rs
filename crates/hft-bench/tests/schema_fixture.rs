@@ -320,6 +320,8 @@ fn suite_records_match_the_schema_fixture() {
         ("risk", "settle"),
         ("risk", "reject"),
         ("risk", "account_lookup"),
+        ("journal", "controlled_journal_enqueue"),
+        ("journal", "controlled_journal_persistence_memory"),
         ("recovery", "canonical_snapshot_encode"),
         ("recovery", "verified_snapshot_restore"),
         ("recovery", "snapshot_tail_replay"),

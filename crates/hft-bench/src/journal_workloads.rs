@@ -3,8 +3,8 @@
 use crate::record::{BenchRecord, Extra};
 use crate::{ALLOCATIONS, DEALLOCATIONS, analyze};
 use hft_journal::{
-    DurableSink, FlushPolicy, JournalReader, JournalRecord, JournalWriter, PersistenceWorker,
-    RECORD_SIZE, RING_CAPACITY, recover,
+    DurableSink, FlushPolicy, JournalChannel, JournalReader, JournalRecord, JournalWriter,
+    PersistenceWorker, RECORD_SIZE, RING_CAPACITY, recover,
 };
 use hft_spsc::SpscQueue;
 use hft_types::SequenceNumber;
@@ -279,6 +279,106 @@ pub fn journal_drain_benchmark(samples: usize, out: &mut Vec<BenchRecord>) {
     persistence_batch_benchmark::<32>(samples, out);
     recovery_scan_benchmark(samples, out);
     saturation_benchmark(samples, out);
+}
+
+/// Measures controlled-channel enqueue and persistence with both flush policies.
+///
+/// # Panics
+///
+/// Panics on a record, sequence, persistence, or allocation mismatch.
+pub fn controlled_journal_benchmarks(samples: usize, out: &mut Vec<BenchRecord>) {
+    if samples == 0 {
+        return;
+    }
+    controlled_enqueue(samples, out);
+    for policy in [FlushPolicy::OnShutdown, FlushPolicy::EveryBatch] {
+        controlled_persistence::<1>(samples, policy, out);
+        controlled_persistence::<8>(samples, policy, out);
+        controlled_persistence::<32>(samples, policy, out);
+    }
+}
+
+fn controlled_enqueue(samples: usize, out: &mut Vec<BenchRecord>) {
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, mut reader) = channel.split(1);
+    for _ in 0..RING_CAPACITY / 2 {
+        writer.enqueue(&PAYLOAD).expect("warm-up enqueue");
+        reader.read().expect("warm-up read");
+    }
+    let mut latencies = vec![0_u64; samples];
+    let mut checksum = 0_u64;
+    let before = allocation_counts();
+    for (offset, sample) in latencies.iter_mut().enumerate() {
+        let started = Instant::now();
+        let sequence = writer.enqueue(black_box(&PAYLOAD)).expect("enqueue");
+        *sample = elapsed_ns(started);
+        let record = reader.read().expect("read enqueued record");
+        assert_eq!(record.sequence(), sequence);
+        assert_eq!(record.slice(), PAYLOAD);
+        checksum_fold(&mut checksum, sequence.0, offset);
+    }
+    assert_gate(before, "controlled_journal_enqueue");
+    writer.close();
+    let mut record = BenchRecord::new(
+        "component",
+        "journal",
+        "controlled_journal_enqueue",
+        &[("capacity", Extra::U64(RING_CAPACITY as u64))],
+    );
+    fill_record(&mut record, &mut latencies);
+    record.checksum = checksum;
+    out.push(record);
+}
+
+fn controlled_persistence<const BATCH: usize>(
+    samples: usize,
+    policy: FlushPolicy,
+    out: &mut Vec<BenchRecord>,
+) {
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
+    for _ in 0..RING_CAPACITY {
+        writer.enqueue(&PAYLOAD).expect("prefill");
+    }
+    writer.close();
+    let mut worker = PersistenceWorker::<_, BATCH>::new(reader, MemorySink::new(), policy)
+        .expect("nonzero batch");
+    assert_eq!(worker.drain_batch().expect("warm-up drain"), BATCH);
+    let occupancy = RING_CAPACITY - BATCH;
+    let batches = samples.min(occupancy / BATCH);
+    let mut latencies = vec![0_u64; batches];
+    let mut drained_total = 0_u64;
+    let before = allocation_counts();
+    for sample in &mut latencies {
+        let started = Instant::now();
+        let drained = worker.drain_batch().expect("controlled drain");
+        *sample = elapsed_ns(started) / BATCH as u64;
+        assert_eq!(drained, BATCH);
+        drained_total += drained as u64;
+    }
+    assert_gate(before, "controlled_journal_persistence_memory");
+    worker.shutdown().expect("closed channel shutdown");
+    let sink = worker.into_sink().expect("healthy sink");
+    assert_eq!(sink.len, RECORD_SIZE * RING_CAPACITY);
+    let mut record = BenchRecord::new(
+        "component",
+        "journal",
+        "controlled_journal_persistence_memory",
+        &[
+            ("batch", Extra::U64(BATCH as u64)),
+            ("occupancy", Extra::U64(occupancy as u64)),
+            (
+                "flush_policy",
+                Extra::Text(match policy {
+                    FlushPolicy::EveryBatch => "every_batch",
+                    FlushPolicy::OnShutdown => "on_shutdown",
+                }),
+            ),
+        ],
+    );
+    fill_record(&mut record, &mut latencies);
+    record.checksum = drained_total;
+    out.push(record);
 }
 
 struct MemorySink {
