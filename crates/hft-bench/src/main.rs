@@ -1,7 +1,8 @@
-//! Benchmark binary: runs the full suite and prints one JSON record per line.
+//! Benchmark binary. Prints one JSON record per cell.
 
 use hft_bench::{ALLOCATIONS, DEALLOCATIONS};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
 struct CountingAllocator;
@@ -35,14 +36,34 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
-fn main() {
-    // Scenario fixtures place large fixed-capacity engines on the stack; the
-    // worker thread gives them room on every platform.
-    let handle = std::thread::Builder::new()
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    let config = match (args.next(), args.next()) {
+        (None, None) => hft_bench::SuiteConfig::full(),
+        (Some(option), None) if option == "--reduced" => hft_bench::SuiteConfig::reduced(),
+        _ => {
+            eprintln!("usage: hft-bench [--reduced]");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Large fixed-capacity fixtures need more stack than the Windows default.
+    let handle = match std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(|| hft_bench::run_suite(hft_bench::SuiteConfig::full()))
-        .expect("suite worker thread");
-    for line in handle.join().expect("suite finished") {
+        .spawn(move || hft_bench::run_suite(config))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("cannot start suite worker: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(records) = handle.join() else {
+        eprintln!("suite worker panicked");
+        return ExitCode::FAILURE;
+    };
+    for line in records {
         println!("{line}");
     }
+    ExitCode::SUCCESS
 }
