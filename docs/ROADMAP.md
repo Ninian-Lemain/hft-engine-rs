@@ -303,6 +303,10 @@ queue pressure, journal stalls, snapshots, recovery, malformed input,
 exhaustion, routing imbalance, and shutdown races with retained seeds. No
 unexplained growth or divergence for the declared run.
 
+The [soak runner](SOAK.md) now checks sustained routed churn, recurring queue
+pressure, resumed snapshot recovery, session faults, and capacity exhaustion.
+Multi-hour evidence and combined service fault coverage remain open.
+
 ## Pre-v1 Stabilization
 
 - Add a small facade crate, validated builder, bounded command/report/event

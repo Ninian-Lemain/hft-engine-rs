@@ -23,7 +23,9 @@ jobs:
       - run: cargo test --doc --workspace
       - run: cargo test -p hft-spsc --features loom loom_
       - run: cargo test -p hft-bench
+      - run: cargo test -p hft-soak
       - run: cargo test -p hft-wire malformed_input_smoke_never_panics
+      - run: cargo run --release -p hft-soak -- --profile smoke
       - run: cargo run --release -p hft-bench
       - run: python scripts/source_ratio.py
       - name: Reject unexpected unsafe code
@@ -31,6 +33,14 @@ jobs:
           found=$(grep -R -n --include='*.rs' -E 'unsafe[[:space:]]*(\{|impl|fn|extern)|UnsafeCell|static[[:space:]]+mut' crates | cut -d: -f1 | sort -u || true)
           allowed=$'crates/hft-bench/src/main.rs\ncrates/hft-ffi/src/lib.rs\ncrates/hft-ffi/tests/native_abi.rs\ncrates/hft-spsc/src/lib.rs'
           test "$found" = "$allowed"
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo +1.85.0 check --locked --workspace --all-targets
+      - run: cargo +1.85.0 test --locked --workspace
 
   miri:
     runs-on: ubuntu-latest

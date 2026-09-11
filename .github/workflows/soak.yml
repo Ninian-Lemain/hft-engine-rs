@@ -1,0 +1,27 @@
+name: Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: Steps per retained seed
+        required: true
+        default: '10000000'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustc -Vv
+      - run: cargo test -p hft-soak
+      - name: Run retained seeds
+        env:
+          SOAK_STEPS: ${{ inputs.steps }}
+        run: cargo run --release -p hft-soak -- --profile nightly --steps "$SOAK_STEPS"
