@@ -260,6 +260,19 @@ dependencies = [
 name = "hft-soak"
 version = "0.19.0"
 dependencies = [
+ "hft-book",
+ "hft-events",
+ "hft-gateway",
+ "hft-io",
+ "hft-journal",
+ "hft-model",
+ "hft-recovery",
+ "hft-risk",
+ "hft-router",
+ "hft-session",
+ "hft-spsc",
+ "hft-types",
+ "hft-wire",
  "sha2",
 ]
 

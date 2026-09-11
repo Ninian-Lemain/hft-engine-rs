@@ -7,6 +7,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hft-book = { path = "../hft-book" }
+hft-events = { path = "../hft-events" }
+hft-gateway = { path = "../hft-gateway" }
+hft-io = { path = "../hft-io" }
+hft-journal = { path = "../hft-journal" }
+hft-model = { path = "../hft-model" }
+hft-recovery = { path = "../hft-recovery" }
+hft-risk = { path = "../hft-risk" }
+hft-router = { path = "../hft-router" }
+hft-session = { path = "../hft-session" }
+hft-spsc = { path = "../hft-spsc" }
+hft-types = { path = "../hft-types" }
+hft-wire = { path = "../hft-wire" }
 sha2 = "0.10.9"
 
 [lints]

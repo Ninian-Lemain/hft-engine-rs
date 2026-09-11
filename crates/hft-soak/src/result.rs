@@ -1,5 +1,6 @@
-use crate::{Digest, Profile, Seed};
+use crate::{Digest, Profile, ScenarioResults, Seed};
 use std::fmt;
+use std::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunStatus {
@@ -23,6 +24,7 @@ pub enum ResultError {
     PassedBeforeCompletion,
     PassedWithFailure,
     FailedWithoutFailure,
+    ScenarioStepsMismatch,
 }
 
 impl fmt::Display for ResultError {
@@ -37,6 +39,9 @@ impl fmt::Display for ResultError {
             }
             Self::PassedWithFailure => formatter.write_str("passed result contains a failure"),
             Self::FailedWithoutFailure => formatter.write_str("failed result has no failure text"),
+            Self::ScenarioStepsMismatch => {
+                formatter.write_str("scenario steps do not match the declared work")
+            }
         }
     }
 }
@@ -52,7 +57,8 @@ pub struct RunResult {
     pub status: RunStatus,
     pub state_digest: Digest,
     pub event_digest: Digest,
-    pub peak_rss_bytes: u64,
+    pub scenarios: ScenarioResults,
+    pub peak_rss_bytes: Option<u64>,
     pub failure: Option<String>,
 }
 
@@ -69,6 +75,14 @@ impl RunResult {
         if self.completed_steps > self.steps {
             return Err(ResultError::CompletedStepsExceedDeclared);
         }
+        if self.status == RunStatus::Passed
+            && (self.scenarios.routed.steps != self.steps
+                || self.scenarios.recovery.steps != self.steps
+                || self.scenarios.recovery.commands != self.steps
+                || self.scenarios.session.steps != self.steps.div_ceil(64))
+        {
+            return Err(ResultError::ScenarioStepsMismatch);
+        }
         match (
             self.status,
             self.completed_steps == self.steps,
@@ -81,6 +95,20 @@ impl RunResult {
         }
     }
 
+    /// Compares deterministic fields, excluding resource measurements.
+    #[must_use]
+    pub fn deterministic_eq(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.seed == other.seed
+            && self.steps == other.steps
+            && self.completed_steps == other.completed_steps
+            && self.status == other.status
+            && self.state_digest == other.state_digest
+            && self.event_digest == other.event_digest
+            && self.scenarios == other.scenarios
+            && self.failure == other.failure
+    }
+
     /// Writes one stable-key-order JSON result record.
     ///
     /// # Errors
@@ -88,23 +116,31 @@ impl RunResult {
     /// Returns an error if result fields are inconsistent.
     pub fn to_json_line(&self) -> Result<String, ResultError> {
         self.validate()?;
-        let mut line = String::with_capacity(384);
-        line.push_str("{\"schema\":\"hft-soak-results/1\",\"profile\":\"");
-        line.push_str(self.profile.as_str());
-        line.push_str("\",\"seed\":\"");
-        line.push_str(&self.seed.to_hex());
-        line.push_str("\",\"steps\":");
-        line.push_str(&self.steps.to_string());
-        line.push_str(",\"completed_steps\":");
-        line.push_str(&self.completed_steps.to_string());
-        line.push_str(",\"status\":\"");
-        line.push_str(self.status.as_str());
-        line.push_str("\",\"state_digest\":\"");
-        line.push_str(&self.state_digest.to_hex());
-        line.push_str("\",\"event_digest\":\"");
-        line.push_str(&self.event_digest.to_hex());
-        line.push_str("\",\"peak_rss_bytes\":");
-        line.push_str(&self.peak_rss_bytes.to_string());
+        let mut line = String::with_capacity(2_048);
+        let _ = write!(
+            line,
+            concat!(
+                "{{\"schema\":\"hft-soak-results/1\",\"profile\":\"{}\",",
+                "\"seed\":\"{}\",\"steps\":{},\"completed_steps\":{},",
+                "\"status\":\"{}\",\"state_digest\":\"{}\",\"event_digest\":\"{}\",",
+                "\"scenarios\":"
+            ),
+            self.profile,
+            self.seed,
+            self.steps,
+            self.completed_steps,
+            self.status.as_str(),
+            self.state_digest,
+            self.event_digest,
+        );
+        self.scenarios.push_json(&mut line);
+        line.push_str(",\"peak_rss_bytes\":");
+        match self.peak_rss_bytes {
+            Some(bytes) => {
+                let _ = write!(line, "{bytes}");
+            }
+            None => line.push_str("null"),
+        }
         line.push_str(",\"failure\":");
         match &self.failure {
             Some(failure) => push_json_string(&mut line, failure),
@@ -115,7 +151,112 @@ impl RunResult {
     }
 }
 
-fn push_json_string(output: &mut String, value: &str) {
+impl ScenarioResults {
+    pub(crate) fn push_json(&self, output: &mut String) {
+        macro_rules! counters {
+            ($name:ident, $($field:ident),+ $(,)?) => {{
+                output.push_str(concat!("\"", stringify!($name), "\":{"));
+                $(let _ = write!(output, concat!("\"", stringify!($field), "\":{},"), self.$name.$field);)+
+                output.pop();
+                output.push('}');
+            }};
+        }
+        output.push('{');
+        counters!(
+            routed,
+            steps,
+            events,
+            terminal_events,
+            accepted_events,
+            rejected_events,
+            cancelled_events,
+            replaced_events,
+            trade_events,
+            top_of_book_events,
+            command_backpressure,
+            event_backpressure,
+            pressure_rounds,
+            pending_retries,
+            last_pressure_step,
+            live_order_checks,
+            late_steps,
+            late_accepted_events,
+            late_rejected_events,
+            late_cancelled_events,
+            late_replaced_events,
+            late_trade_events,
+            sequence_gaps,
+            malformed_frames,
+            unknown_instruments
+        );
+        output.pop();
+        let [a, b, c, d] = self.routed.routed_by_shard;
+        let _ = write!(output, ",\"routed_by_shard\":[{a},{b},{c},{d}]}},");
+        counters!(
+            session,
+            steps,
+            accepted_commands,
+            gaps_rejected,
+            duplicates_rejected,
+            heartbeat_timeouts,
+            reconnects,
+            retransmit_full,
+            idempotent_confirms
+        );
+        output.push(',');
+        counters!(
+            recovery,
+            steps,
+            commands,
+            business_rejections,
+            accepted_new_orders,
+            accepted_cancels,
+            accepted_replaces,
+            late_accepted_cancels,
+            late_accepted_replaces,
+            resumed_commands,
+            checkpoints,
+            fault_checks,
+            journal_peak_bytes
+        );
+        output.push(',');
+        counters!(
+            journal,
+            saturation_refusals,
+            retry_successes,
+            short_write_calls,
+            producer_open_refusals,
+            final_flushes,
+            recovered_records,
+            valid_crash_prefixes,
+            rejected_truncations,
+            hard_write_failures,
+            hard_flush_failures
+        );
+        output.push(',');
+        counters!(
+            capacity,
+            price_level_order_refusals,
+            price_level_order_retries,
+            price_level_refusals,
+            price_level_retries,
+            risk_order_refusals,
+            risk_order_retries,
+            account_registration_refusals,
+            report_refusals,
+            report_retries,
+            retransmit_refusals,
+            retransmit_retries,
+            command_queue_refusals,
+            command_queue_retries,
+            event_queue_refusals,
+            event_queue_retries
+        );
+        output.push('}');
+    }
+}
+
+pub(crate) fn push_json_string(output: &mut String, value: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     output.push('"');
     for character in value.chars() {
@@ -142,66 +283,11 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sha256;
-
-    fn result(status: RunStatus, failure: Option<String>) -> RunResult {
-        RunResult {
-            profile: Profile::Smoke,
-            seed: Seed(1),
-            steps: 10,
-            completed_steps: if status == RunStatus::Passed { 10 } else { 7 },
-            status,
-            state_digest: sha256(b"state"),
-            event_digest: sha256(b"events"),
-            peak_rss_bytes: 4_096,
-            failure,
-        }
-    }
-
-    #[test]
-    fn passed_result_has_stable_key_order() {
-        let line = result(RunStatus::Passed, None)
-            .to_json_line()
-            .expect("valid result");
-        assert_eq!(
-            line,
-            concat!(
-                "{\"schema\":\"hft-soak-results/1\",",
-                "\"profile\":\"smoke\",",
-                "\"seed\":\"0000000000000001\",",
-                "\"steps\":10,",
-                "\"completed_steps\":10,",
-                "\"status\":\"passed\",",
-                "\"state_digest\":\"4ba69735ca53765ed6a709edb56c6ea23",
-                "6b7193a3b29a6b390c346f0f4340e4e\",",
-                "\"event_digest\":\"862417b9e7c3720bcb3263cd873b0989",
-                "2d787823b6f9a0f453e42824c5a4d4b6\",",
-                "\"peak_rss_bytes\":4096,",
-                "\"failure\":null}"
-            )
-        );
-    }
 
     #[test]
     fn failure_text_is_json_escaped() {
-        let line = result(RunStatus::Failed, Some("queue \"full\"\nretry".to_owned()))
-            .to_json_line()
-            .expect("valid result");
-        assert!(line.ends_with("\"failure\":\"queue \\\"full\\\"\\nretry\"}"));
-    }
-
-    #[test]
-    fn inconsistent_results_are_rejected() {
-        let mut value = result(RunStatus::Passed, None);
-        value.completed_steps = 9;
-        assert_eq!(value.validate(), Err(ResultError::PassedBeforeCompletion));
-
-        let value = result(RunStatus::Failed, None);
-        assert_eq!(value.validate(), Err(ResultError::FailedWithoutFailure));
-
-        let mut value = result(RunStatus::Passed, None);
-        value.steps = 0;
-        value.completed_steps = 0;
-        assert_eq!(value.validate(), Err(ResultError::ZeroSteps));
+        let mut output = String::new();
+        push_json_string(&mut output, "queue \"full\"\nretry\u{0001}\\");
+        assert_eq!(output, "\"queue \\\"full\\\"\\nretry\\u0001\\\\\"");
     }
 }

@@ -93,7 +93,7 @@ impl fmt::Display for SeedParseError {
         match self {
             Self::Length { found } => write!(
                 formatter,
-                "seed must contain {SEED_HEX_LEN} lowercase hex digits; found {found}"
+                "seed must contain {SEED_HEX_LEN} lowercase hex digits. Found {found}"
             ),
             Self::InvalidCharacter { index, byte } => write!(
                 formatter,
@@ -187,12 +187,14 @@ pub fn parse_retained_seeds(input: &str) -> Result<Vec<Seed>, RetainedSeedError>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
     ZeroSteps,
+    SequenceExhaustion,
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroSteps => formatter.write_str("steps must be greater than zero"),
+            Self::SequenceExhaustion => formatter.write_str("steps must be less than u64::MAX"),
         }
     }
 }
@@ -211,10 +213,13 @@ impl RunConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::ZeroSteps`] when no work was requested.
+    /// Rejects zero steps or a run that would exhaust its sequence counter.
     pub const fn new(profile: Profile, seed: Seed, steps: u64) -> Result<Self, ConfigError> {
         if steps == 0 {
             return Err(ConfigError::ZeroSteps);
+        }
+        if steps == u64::MAX {
+            return Err(ConfigError::SequenceExhaustion);
         }
         Ok(Self {
             profile,
@@ -324,7 +329,7 @@ impl CliOptions {
                     let parsed = value
                         .parse::<u64>()
                         .map_err(|_| CliError::InvalidSteps(value.clone()))?;
-                    if parsed == 0 {
+                    if parsed == 0 || parsed == u64::MAX {
                         return Err(CliError::InvalidSteps(value));
                     }
                     set_once(&mut steps, parsed, &option)?;
