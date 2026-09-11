@@ -151,6 +151,7 @@ dependencies = [
  "hft-book",
  "hft-gateway",
  "hft-io",
+ "hft-journal",
  "hft-recovery",
  "hft-risk",
  "hft-spsc",

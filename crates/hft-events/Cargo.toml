@@ -15,6 +15,7 @@ hft-types = { path = "../hft-types" }
 hft-wire = { path = "../hft-wire" }
 
 [dev-dependencies]
+hft-journal = { path = "../hft-journal" }
 hft-recovery = { path = "../hft-recovery" }
 hft-risk = { path = "../hft-risk" }
 
