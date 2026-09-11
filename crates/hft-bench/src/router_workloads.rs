@@ -1,5 +1,7 @@
 use crate::record::{BenchRecord, Extra};
-use crate::{ALLOCATIONS, DEALLOCATIONS, push_latency_record};
+use crate::{
+    ALLOCATIONS, DEALLOCATIONS, allocation_gate, assert_allocation_gate, push_latency_record,
+};
 use hft_events::EventBatch;
 use hft_gateway::Gateway;
 use hft_risk::{RiskEngine, RiskLimits};
@@ -12,6 +14,7 @@ use hft_types::{
     AccountId, Command, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, SequenceNumber,
     Side, TimeInForce,
 };
+use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -34,6 +37,146 @@ pub fn router_benchmarks(samples: usize, out: &mut Vec<BenchRecord>) {
     route_command(samples, out);
     route_shard_event(samples, out);
     full_command_queue(samples, out);
+    for (spacing, shape) in [(1, "dense"), (7_919, "sparse")] {
+        lookup_cell::<64>(samples, spacing, shape, false, out);
+        lookup_cell::<64>(samples, spacing, shape, true, out);
+        lookup_cell::<1024>(samples, spacing, shape, false, out);
+        lookup_cell::<1024>(samples, spacing, shape, true, out);
+    }
+    reverse_lookup_cell::<64>(samples, out);
+    reverse_lookup_cell::<1024>(samples, out);
+}
+
+fn lookup_table<const SHARDS: usize>(spacing: u32) -> RouteTable<SHARDS> {
+    RouteTable::try_new(std::array::from_fn(|index| InstrumentRoute {
+        instrument_id: InstrumentId(10_000 + u32::try_from(index).expect("index") * spacing),
+        shard_id: ShardId(u16::try_from(SHARDS - 1 - index).expect("shard")),
+    }))
+    .expect("lookup table")
+}
+
+fn lookup_cell<const SHARDS: usize>(
+    samples: usize,
+    spacing: u32,
+    shape: &'static str,
+    mixed: bool,
+    out: &mut Vec<BenchRecord>,
+) {
+    const BATCH: usize = 64;
+    let table = lookup_table::<SHARDS>(spacing);
+    let mut timings = vec![0; samples];
+    let mut checksum = 0_u64;
+    let mut seed = 0x127b_e615_fe22_a934_u64;
+    let gate = allocation_gate();
+    for step in 0..WARMUP + samples {
+        let mut expected = [None; BATCH];
+        let queries: [InstrumentId; BATCH] = std::array::from_fn(|offset| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let index =
+                usize::try_from(seed % u64::try_from(SHARDS).expect("shards")).expect("index");
+            if mixed && offset % 2 == 0 {
+                match offset % 6 {
+                    0 => InstrumentId(9_999),
+                    2 => InstrumentId(u32::MAX),
+                    _ => InstrumentId(
+                        10_000
+                            + u32::try_from(index).expect("index") * spacing
+                            + if spacing == 1 {
+                                u32::try_from(SHARDS).expect("shards")
+                            } else {
+                                1
+                            },
+                    ),
+                }
+            } else {
+                expected[offset] = Some(ShardId(u16::try_from(SHARDS - 1 - index).expect("shard")));
+                InstrumentId(10_000 + u32::try_from(index).expect("index") * spacing)
+            }
+        });
+        let started = Instant::now();
+        let results = queries.map(|query| black_box(&table).shard_for(black_box(query)));
+        black_box(&results);
+        let elapsed = started.elapsed().as_nanos() / BATCH as u128;
+        assert_eq!(results, expected);
+        if step >= WARMUP {
+            timings[step - WARMUP] = u64::try_from(elapsed).unwrap_or(u64::MAX);
+            for result in results {
+                checksum = checksum.wrapping_add(result.map_or(65_536, |shard| u64::from(shard.0)));
+            }
+        }
+    }
+    assert_allocation_gate(gate, "route lookup");
+    push_latency_record(
+        out,
+        BenchRecord {
+            checksum,
+            ..BenchRecord::new(
+                "component",
+                "router",
+                if mixed { "lookup_mixed" } else { "lookup_hit" },
+                &[
+                    ("shards", Extra::U64(u64::try_from(SHARDS).expect("shards"))),
+                    ("shape", Extra::Text(shape)),
+                    ("batch", Extra::U64(64)),
+                    (
+                        "state_bytes",
+                        Extra::U64(u64::try_from(size_of::<RouteTable<SHARDS>>()).expect("size")),
+                    ),
+                ],
+            )
+        },
+        &mut timings,
+    );
+}
+
+fn reverse_lookup_cell<const SHARDS: usize>(samples: usize, out: &mut Vec<BenchRecord>) {
+    let table = lookup_table::<SHARDS>(7_919);
+    let mut timings = vec![0; samples];
+    let mut checksum = 0_u64;
+    let gate = allocation_gate();
+    for step in 0..WARMUP + samples {
+        let queries: [ShardId; 64] = std::array::from_fn(|offset| {
+            ShardId(u16::try_from((step * 31 + offset * 7) % SHARDS).expect("shard"))
+        });
+        let started = Instant::now();
+        let results = queries.map(|query| black_box(&table).instrument_for(black_box(query)));
+        black_box(&results);
+        let elapsed = started.elapsed().as_nanos() / 64;
+        for (query, result) in queries.into_iter().zip(results) {
+            let expected =
+                10_000 + u32::try_from(SHARDS - 1 - usize::from(query.0)).expect("index") * 7_919;
+            assert_eq!(result, Some(InstrumentId(expected)));
+            if step >= WARMUP {
+                checksum = checksum.wrapping_add(u64::from(expected));
+            }
+        }
+        if step >= WARMUP {
+            timings[step - WARMUP] = u64::try_from(elapsed).unwrap_or(u64::MAX);
+        }
+    }
+    assert_allocation_gate(gate, "reverse route lookup");
+    push_latency_record(
+        out,
+        BenchRecord {
+            checksum,
+            ..BenchRecord::new(
+                "component",
+                "router",
+                "reverse_lookup",
+                &[
+                    ("shards", Extra::U64(u64::try_from(SHARDS).expect("shards"))),
+                    ("batch", Extra::U64(64)),
+                    (
+                        "state_bytes",
+                        Extra::U64(u64::try_from(size_of::<RouteTable<SHARDS>>()).expect("size")),
+                    ),
+                ],
+            )
+        },
+        &mut timings,
+    );
 }
 
 fn gateway(instrument_id: InstrumentId) -> BenchGateway {

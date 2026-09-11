@@ -11,6 +11,7 @@ use hft_types::{
     AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, RejectReason,
     ReplaceOrder, ReportBuffer, SequenceNumber, Side, TimeInForce,
 };
+use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -821,10 +822,8 @@ fn replace_book_cell(
     let mut latencies = vec![0_u64; samples];
     let mut checksum = 0_u64;
     let mut next_id = 1_000_000_u64;
-    // Every sample gets a fresh one-maker book built untimed, so the replace
-    // always starts from the exact same shape.
-    for (offset, sample) in latencies.iter_mut().enumerate() {
-        let step = WARMUP + offset;
+    let reject_unknown = scenario == "replace_reject_unknown";
+    for step in 0..WARMUP + samples {
         let mut book = Box::new(OrderBook::<128, 8>::new(INSTRUMENT));
         let mut reports = ReportBuffer::<16>::new();
         let maker_id = take_id(&mut next_id);
@@ -842,35 +841,34 @@ fn replace_book_cell(
         .expect("fixture maker rests");
         reports.clear();
         let replace = ReplaceOrder {
-            order_id: OrderId(maker_id),
+            order_id: OrderId(maker_id + u64::from(reject_unknown)),
             account_id: MAKER_ACCOUNT,
             instrument_id: INSTRUMENT,
             sequence: SequenceNumber(maker_id),
             price: PriceTicks(new_price),
             quantity: Quantity(new_qty),
         };
-        if step >= WARMUP {
-            let started = Instant::now();
-            let result = book.replace(replace);
-            let elapsed_ns = started.elapsed().as_nanos();
-            match result {
-                Ok(replaced) => checksum ^= replaced.new_quantity.0,
-                Err(_) => checksum ^= 0x9e,
-            }
-            *sample = u64::try_from(elapsed_ns).unwrap_or(u64::MAX);
+        let before = snapshot_gate();
+        let started = Instant::now();
+        let result = black_box(&mut book).replace(black_box(replace));
+        black_box(&result);
+        let elapsed_ns = started.elapsed().as_nanos();
+        assert_gate(before, snapshot_gate(), scenario);
+        let contribution = if reject_unknown {
+            assert_eq!(result, Err(RejectReason::UnknownOrder));
+            0x9e
         } else {
-            let _ = book.replace(replace);
+            let replaced = result.expect("replace succeeds");
+            assert_eq!(replaced.new_quantity, Quantity(new_qty));
+            assert_eq!(replaced.price, PriceTicks(new_price));
+            replaced.new_quantity.0
+        };
+        if step >= WARMUP {
+            latencies[step - WARMUP] = u64::try_from(elapsed_ns).unwrap_or(u64::MAX);
+            checksum = checksum.wrapping_add(contribution);
         }
-        debug_assert_eq!(book.order_count(), 1, "replaced order still rests");
+        assert_eq!(book.order_count(), 1, "maker still rests");
     }
-    assert_gate(
-        snapshot_gate(),
-        (
-            ALLOCATIONS.load(Ordering::SeqCst),
-            DEALLOCATIONS.load(Ordering::SeqCst),
-        ),
-        scenario,
-    );
     finish(
         out,
         BenchRecord::new(
@@ -951,7 +949,6 @@ fn replace_risk_cell(samples: usize, out: &mut Vec<BenchRecord>) {
 }
 
 pub fn replace_benchmarks(samples: usize, out: &mut Vec<BenchRecord>) {
-    let _ = samples; // risk cell is O(1) per sample; kept for symmetry.
     replace_book_cell(samples, "replace_reduce", 100, 5, out);
     replace_book_cell(samples, "replace_increase", 100, 12, out);
     replace_book_cell(samples, "replace_reprice", 101, 10, out);

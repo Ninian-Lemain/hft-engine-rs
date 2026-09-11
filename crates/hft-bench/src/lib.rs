@@ -6,6 +6,7 @@
 pub mod event_workloads;
 pub mod extra_workloads;
 pub mod journal_workloads;
+pub mod liquidity_workloads;
 pub mod record;
 pub mod recovery_workloads;
 pub mod router_workloads;
@@ -110,6 +111,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     risk_benchmark(config, &mut records);
     price_benchmark(config, &mut records);
     match_plan_benchmark(config, &mut records);
+    liquidity_workloads::liquidity_benchmarks(config.fifo_samples, &mut records);
     extra_workloads::parser_benchmark(config.parser_samples, &mut records);
     extra_workloads::spsc_benchmark(config.spsc_samples, 0x0a7c_bee5, &mut records);
     extra_workloads::gateway_mixed_benchmark(
