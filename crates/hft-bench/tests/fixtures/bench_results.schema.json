@@ -1,7 +1,7 @@
 {
   "schema": "hft-bench-results/1",
   "boundaries": ["component", "gateway", "network"],
-  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session", "journal", "recovery", "events", "router"],
+  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session", "journal", "recovery", "events", "router", "engine"],
   "required_strings": ["boundary", "component", "scenario"],
   "required_numbers": [
     "samples",
@@ -17,6 +17,7 @@
   ],
   "checksum_key": "checksum",
   "param_names": [
+    "path",
     "messages",
     "capacity",
     "max_occupancy",

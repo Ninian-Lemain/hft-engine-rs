@@ -220,6 +220,12 @@ pub struct JournalStatusReader<'queue> {
 }
 
 impl JournalStatusReader<'_> {
+    /// Reads only the terminal persistence failure flag.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.state.poisoned.load(Ordering::Acquire)
+    }
+
     /// Counters may advance during this call. Durable never exceeds written.
     #[must_use]
     pub fn snapshot(&self) -> JournalStatus {

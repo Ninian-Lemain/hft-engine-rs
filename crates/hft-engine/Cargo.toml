@@ -1,5 +1,5 @@
 [package]
-name = "hft-bench"
+name = "hft-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,17 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-hft-engine = { path = "../hft-engine" }
-hft-book = { path = "../hft-book" }
 hft-events = { path = "../hft-events" }
 hft-gateway = { path = "../hft-gateway" }
 hft-io = { path = "../hft-io" }
-hft-model = { path = "../hft-model" }
-hft-risk = { path = "../hft-risk" }
-hft-recovery = { path = "../hft-recovery" }
-hft-router = { path = "../hft-router" }
 hft-journal = { path = "../hft-journal" }
-hft-session = { path = "../hft-session" }
+hft-recovery = { path = "../hft-recovery" }
+hft-risk = { path = "../hft-risk" }
 hft-spsc = { path = "../hft-spsc" }
 hft-types = { path = "../hft-types" }
 hft-wire = { path = "../hft-wire" }

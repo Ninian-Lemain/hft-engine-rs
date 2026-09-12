@@ -24,6 +24,7 @@ jobs:
       - run: cargo test -p hft-spsc --features loom loom_
       - run: cargo test -p hft-bench
       - run: cargo test -p hft-soak
+      - run: cargo test -p hft-engine
       - run: cargo test -p hft-wire malformed_input_smoke_never_panics
       - run: cargo run --release -p hft-soak -- --profile smoke
       - run: cargo run --release -p hft-bench

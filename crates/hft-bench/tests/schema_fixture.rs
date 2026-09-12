@@ -318,6 +318,7 @@ fn suite_records_match_the_schema_fixture() {
         ("router", "lookup_hit"),
         ("router", "lookup_mixed"),
         ("router", "reverse_lookup"),
+        ("engine", "journaled_command"),
         ("book", "replace_reduce"),
         ("book", "replace_increase"),
         ("book", "replace_reprice"),

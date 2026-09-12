@@ -10,6 +10,7 @@ members = [
     "crates/hft-model",
     "crates/hft-gateway",
     "crates/hft-events",
+    "crates/hft-engine",
     "crates/hft-router",
     "crates/hft-ffi",
     "crates/hft-replay",

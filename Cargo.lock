@@ -110,6 +110,7 @@ name = "hft-bench"
 version = "0.19.0"
 dependencies = [
  "hft-book",
+ "hft-engine",
  "hft-events",
  "hft-gateway",
  "hft-io",
@@ -140,6 +141,21 @@ dependencies = [
  "hft-gateway",
  "hft-replay",
  "hft-risk",
+ "hft-types",
+ "hft-wire",
+]
+
+[[package]]
+name = "hft-engine"
+version = "0.19.0"
+dependencies = [
+ "hft-events",
+ "hft-gateway",
+ "hft-io",
+ "hft-journal",
+ "hft-recovery",
+ "hft-risk",
+ "hft-spsc",
  "hft-types",
  "hft-wire",
 ]

@@ -3,6 +3,7 @@
 //! warm-up separated from sampling, allocation gates, and stable checksums.
 #![forbid(unsafe_code)]
 
+pub mod engine_workloads;
 pub mod event_workloads;
 pub mod extra_workloads;
 pub mod journal_workloads;
@@ -132,6 +133,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     recovery_workloads::recovery_benchmarks(config.tif_samples, &mut records);
     event_workloads::event_benchmarks(config.tif_samples, &mut records);
     router_workloads::router_benchmarks(config.tif_samples, &mut records);
+    engine_workloads::engine_benchmarks(config.tif_samples, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }
 
