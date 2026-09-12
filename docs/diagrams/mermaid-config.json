@@ -1,0 +1,39 @@
+{
+  "theme": "base",
+  "htmlLabels": false,
+  "deterministicIds": true,
+  "deterministicIDSeed": "exchange-diagrams",
+  "themeVariables": {
+    "fontFamily": "Arial, Helvetica, sans-serif",
+    "fontSize": "18px",
+    "primaryColor": "#e8f1ff",
+    "primaryTextColor": "#0f172a",
+    "primaryBorderColor": "#1d4ed8",
+    "lineColor": "#475569",
+    "secondaryColor": "#ecfdf5",
+    "tertiaryColor": "#f1f5f9",
+    "clusterBkg": "#f8fafc",
+    "clusterBorder": "#94a3b8",
+    "noteBkgColor": "#f1f5f9",
+    "noteTextColor": "#0f172a",
+    "noteBorderColor": "#94a3b8"
+  },
+  "flowchart": {
+    "htmlLabels": false,
+    "curve": "linear",
+    "nodeSpacing": 28,
+    "rankSpacing": 36,
+    "padding": 14,
+    "wrappingWidth": 260,
+    "subGraphTitleMargin": { "top": 10, "bottom": 18 }
+  },
+  "sequence": {
+    "useMaxWidth": true,
+    "mirrorActors": false,
+    "actorMargin": 42,
+    "messageMargin": 28,
+    "noteMargin": 12,
+    "messageFontSize": 18,
+    "noteFontSize": 18
+  }
+}

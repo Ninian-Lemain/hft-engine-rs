@@ -1,36 +1,42 @@
 sequenceDiagram
-    autonumber
-
-    participant RX as RX Queue
+    accTitle: New-order application inside the gateway
+    accDescr: After admission, the gateway consumes the command sequence, checks the order ID, reserves risk, and preflights matching. Business rejection consumes sequence but leaves no new resting order. The event engine publishes the result afterward.
+    participant Events as Event engine
     participant GW as Gateway
-    participant Risk as Risk Engine
-    participant Book as Order Book
-    participant Reports as Report Buffer
+    participant Risk as Risk
+    participant Book as Book
 
-    RX->>GW: Borrowed RX frame
-    GW->>GW: Validate protocol and sequence
-    GW->>Risk: check_and_reserve(order)
-
-    alt Risk rejection
-        Risk-->>GW: RejectReason
-        GW-->>RX: Fail closed
-    else Reservation active
-        Risk-->>GW: Exposure reserved
-        GW->>Book: Preflight and submit
-
-        alt Book rejection
-            Book-->>GW: Validation or capacity error
-            GW->>Risk: settle(order_id, 0)
-            Risk-->>GW: Reservation released
-            GW-->>RX: Rejection with state restored
-        else Order matched or resting
-            Book->>Reports: Write fixed-capacity reports
-
-            loop Each execution report
-                GW->>Risk: Record maker fill
-                GW->>Risk: Record taker fill
+    Note over Events,Book: Sequence and event capacity already admitted
+    Events->>GW: Apply NewOrder
+    GW->>GW: Recheck and consume sequence
+    alt Duplicate or older order ID
+        GW-->>Events: Business rejection
+    else New order ID
+        GW->>GW: Advance order ID watermark
+        GW->>Risk: Check and reserve
+        alt Risk rejection
+            Risk-->>GW: RejectReason
+            GW-->>Events: Business rejection
+        else Reservation active
+            GW->>Book: Build bounded MatchPlan
+            Note over Book: Preflight policy,<br/>liquidity and capacity
+            alt Book rejection
+                Book-->>GW: RejectReason
+                GW->>Risk: Release taker reservation
+                GW-->>Events: Business rejection
+            else Plan accepted
+                Book->>Book: Apply fills and<br/>resting remainder
+                Book-->>GW: Summary and fixed reports
+                loop Each trade report
+                    GW->>Risk: Record maker and taker fills
+                end
+                opt Untraded remainder does not rest
+                    GW->>Risk: Release unused taker reservation
+                end
+                GW-->>Events: NewOrder outcome
             end
-
-            GW-->>RX: GatewayOutcome
         end
     end
+    Events->>Events: Publish EventBatch
+    Note over Events,Book: Business rejections publish Rejected and consume sequence
+    Note over Events,Book: Internal risk or publication failures are fatal

@@ -187,19 +187,52 @@ sync.
 
 ## Workflow Diagrams
 
-### Packet-to-Report Data Path
+The router and journaled engine are separate entry points. The router's
+`MatchingShard` does not yet own `hft-engine` or a journal. Session admission
+is also a separate caller-managed component.
 
-[![Packet-to-report workflow](docs/diagrams/packet-to-report.svg)](docs/diagrams/packet-to-report.mmd)
+### Routed Commands and Events
 
-The parser borrows the RX frame. Only the optional cross-core handoff copies
-a normalized fixed-size order into a preallocated queue slot.
+[![Routed command and event path](docs/diagrams/packet-to-report.svg)](docs/diagrams/packet-to-report.mmd)
+
+The router parses a borrowed frame into a fixed-size new, cancel, or replace
+command. Each shard checks its sequence after dequeue. Event pressure retains
+one pending command. Events are ordered within a shard, not merged across
+shards. Parse, route, and sequence errors return without an event or sequence
+advance. Replay digests are separate from this processing path.
+
+### Journaled Engine
+
+[![Single-instrument journaled engine](docs/diagrams/journaled-engine.svg)](docs/diagrams/journaled-engine.mmd)
+
+`EngineStorage` owns the event and journal queues. The builder returns the
+engine and both consumers without creating threads. Admission enqueues the
+journal record before gateway application. The persistence worker writes and
+flushes separately. Events report application, not durability. An in-flight
+command can race a persistence failure. A full event or journal queue refuses
+admission before mutation. Observed persistence or internal failures stop the
+engine.
 
 ### New-Order Transaction
 
 [![New-order transaction](docs/diagrams/new-order-transaction.svg)](docs/diagrams/new-order-transaction.mmd)
 
-Both SVG images are generated from the linked, version-controlled Mermaid
-sources so architectural changes remain reviewable.
+This is the gateway application shared by both paths after admission. Business
+rejections consume sequence and may advance order ID watermarks. Book rejection
+releases the taker reservation. It does not rewind the whole gateway state.
+
+### Shutdown and Recovery
+
+[![Engine shutdown and recovery](docs/diagrams/recovery-lifecycle.svg)](docs/diagrams/recovery-lifecycle.mmd)
+
+Snapshots require stopped admission and completed persistence. Event drain is
+the caller's responsibility, not a snapshot precondition. Restore uses fresh
+queues and the original report bound. Snapshot selection, retention, and a
+persisted configuration manifest remain open.
+
+The SVG images are generated from the linked Mermaid sources. See
+[diagram rendering](docs/diagrams/README.md) and the
+[engine boundary](docs/ENGINE.md) for details.
 
 ## What I Learned
 

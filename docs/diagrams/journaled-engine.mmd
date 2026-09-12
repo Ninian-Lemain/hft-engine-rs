@@ -1,0 +1,29 @@
+flowchart TB
+    accTitle: Single-instrument journaled engine
+    accDescr: Engine checks admission, reserves event capacity, and enqueues a journal record before gateway application. Separate consumers receive events and persist journal records. Event publication is not a durability acknowledgment.
+
+    Input["Frame parsed once, or Command<br/>One configured instrument"] --> Check
+    subgraph Engine["hft-engine: admission owner"]
+        Check["Check lifecycle and persistence status<br/>Check instrument and sequence alignment"]
+        Admit["Check next command sequence<br/>Reserve one event slot"]
+        Enqueue["Enqueue 64-byte journal record<br/>Before gateway application"]
+        Apply["Apply command to gateway<br/>Risk, book and fixed reports"]
+        Publish["Publish one complete EventBatch"]
+        Check --> Admit --> Enqueue --> Apply --> Publish
+    end
+    Publish --> EventQueue["Bounded event SPSC"]
+    EventQueue --> EventConsumer["Event consumer<br/>Application result, not durability"]
+    Enqueue --> JournalQueue["Bounded journal SPSC"]
+    JournalQueue --> Worker["PersistenceWorker<br/>Validate, batch and write"]
+    Worker --> Flush["Flush sink<br/>EveryBatch or OnShutdown"]
+    Worker -. "Written or failed" .-> Status["Shared journal status<br/>Watermarks, failure and shutdown"]
+    Flush -. "Durable / final shutdown" .-> Status
+
+    classDef input fill:#e8f1ff,stroke:#1d4ed8,color:#0f172a
+    classDef hot fill:#ecfdf5,stroke:#047857,color:#064e3b
+    classDef queue fill:#f5f3ff,stroke:#6d28d9,color:#3b0764
+    classDef cold fill:#f1f5f9,stroke:#475569,color:#0f172a
+    class Input,EventConsumer input
+    class Check,Admit,Enqueue,Apply,Publish hot
+    class EventQueue,JournalQueue queue
+    class Worker,Flush,Status cold

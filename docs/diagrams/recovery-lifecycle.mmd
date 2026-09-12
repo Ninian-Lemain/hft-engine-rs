@@ -1,0 +1,35 @@
+flowchart LR
+    accTitle: Engine shutdown and recovery
+    accDescr: The caller stops admission, flushes the journal, drains events, and publishes a snapshot. Restore validates canonical state and a contiguous journal tail before building an engine with fresh queues. Snapshot selection and configuration manifests remain caller responsibilities.
+
+    subgraph Shutdown["Shutdown and snapshot"]
+        direction TB
+        Stop["Caller stops upstream input<br/>Finish the last admitted command"] --> Close["Engine stop_admission<br/>Close journal producer"]
+        Close --> Drain["PersistenceWorker shutdown<br/>Drain journal and flush sink"]
+        Drain --> Complete["Require successful shutdown<br/>Written and durable cuts match gateway"]
+        Drain -. "Write or flush failure" .-> Failed["Failed engine<br/>No new snapshot"]
+        Complete --> Events["Caller drains event consumer<br/>Before retiring queue storage"]
+        Events --> Snapshot["Encode canonical snapshot v1<br/>Gateway, risk, book and applied sequence"]
+        Snapshot --> Publish["Publish to a new generation path<br/>SHA-256 integrity"]
+    end
+
+    subgraph Restart["Restore with the original report bound"]
+        direction TB
+        Select["Caller selects snapshot and journal tail"]
+        Verify["Verify version, integrity and capacity shape<br/>Rebuild indexes and free lists"]
+        Replay["Replay contiguous journal tail<br/>Reject overlap, gaps and invalid records"]
+        Build["EngineBuilder restore and build<br/>Expected instrument and fresh queue storage"]
+        Select --> Verify --> Replay --> Build
+        Build --> Workers["Create persistence worker<br/>Keep event and journal consumers alive"]
+        Workers --> Resume["Resume at the next command sequence<br/>Historical events are not republished"]
+    end
+    Shutdown -. "Later restart" .-> Restart
+
+    classDef hot fill:#ecfdf5,stroke:#047857,color:#064e3b
+    classDef cold fill:#f1f5f9,stroke:#475569,color:#0f172a
+    classDef state fill:#f5f3ff,stroke:#6d28d9,color:#3b0764
+    classDef failure fill:#fff7ed,stroke:#c2410c,color:#7c2d12
+    class Stop,Close,Resume hot
+    class Drain,Complete,Events,Verify,Replay,Build,Workers cold
+    class Snapshot,Publish,Select state
+    class Failed failure
