@@ -309,6 +309,12 @@ Multi-hour evidence and combined service fault coverage remain open.
 
 ## Pre-v1 Stabilization
 
+The initial [engine facade](ENGINE.md) joins single-instrument admission,
+bounded events, and journal persistence status. Tests cover queue pressure,
+worker failure, shutdown, snapshot restart, and separate worker threads.
+Router and session ownership, a persisted configuration manifest, operational
+recovery workflows, and API review remain open.
+
 - Add a small facade crate, validated builder, bounded command/report/event
   API, ownership/backpressure rustdoc, MSRV/features, examples, and format/API
   compatibility policy. The public API cannot bypass sequence, risk, or capacity.

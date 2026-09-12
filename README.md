@@ -73,11 +73,11 @@ The latency numbers below are mostly a product of data layout:
 - Orders inside a price level form an intrusive doubly linked FIFO over
   stable slot indices. Fills and cancels rewrite two links in place; peer
   orders never move, so a slot handle stays valid for the life of the order.
-- A per-side sorted-level index (binary search plus a free-slot pool) gives
-  O(1) best-price discovery and O(log n) level maintenance without scanning
-  the level array.
+- A per-side sorted-level index gives O(1) best-price discovery and O(log n)
+  price lookup. Creating or removing a level shifts O(n) compact index entries,
+  not the orders stored in those levels.
 - An open-addressed `OrderId -> slot` index at bounded load makes cancel
-  lookup expected O(1). It costs 64 KiB for the benchmark book shape.
+  lookup expected O(1). Each index entry occupies 16 bytes on x86_64.
 - The SPSC handoff pads head and tail positions onto separate cache lines so
   producer and consumer never false-share. A slot is published with Release
   and observed with Acquire; thread-private cached positions need no atomics
@@ -92,7 +92,7 @@ The latency numbers below are mostly a product of data layout:
   (parsing, sequencing, risk, matching, reports, SPSC handoff) after
   initialization.
 - O(1)-with-respect-to-book-shape identity lookups at bounded load factors.
-- O(log levels) price-level maintenance, O(1) best-price discovery.
+- O(log levels) price lookup, O(1) best-price discovery.
 - Flat per-operation latency independent of FIFO depth.
 - Single-traversal matching: one plan walk, one mutation walk, one report
   per fill, preflighted capacity so rejection mutates nothing.
@@ -161,6 +161,7 @@ the full inventory and native-boundary policy.
 | `hft-book` | Price-time matching: stable-slot FIFO levels, sorted-level indices, `OrderId` index, match plans | None |
 | `hft-gateway` | Transaction coordination and report accounting | None |
 | `hft-events` | Sequenced command event batches and bounded SPSC publication | None after construction |
+| `hft-engine` | Single-instrument admission, journal status, shutdown, and snapshot boundary | None in measured admission |
 | `hft-router` | Fixed instrument routes, shard command queues, and shard event queues | None after construction |
 | `hft-replay` | Ordered replay and stable final-state digest | None in engine |
 | `hft-recovery` | Canonical snapshots, SHA-256 verification, and journal tail restore | Cold path |
@@ -174,10 +175,11 @@ slot: a bounded single-copy handoff, not end-to-end zero-copy.
 
 Matching internals: each side of the book keeps price levels in a
 fixed-capacity array. A per-side sorted-level index (binary search plus a
-free-slot pool) provides O(1) best-price discovery and O(log n) level
-maintenance. Inside a level, orders live in an intrusive doubly linked FIFO
-with stable slot handles, so fills and cancels never shift peer orders. An
-open-addressed `OrderId -> slot` index makes cancel/lookup expected O(1).
+free-slot pool) provides O(1) best-price discovery and O(log n) price lookup.
+Level insertion and removal shift O(n) index entries. Inside a level, orders
+live in an intrusive doubly linked FIFO with stable slot handles, so fills and
+cancels never shift peer orders. An open-addressed `OrderId -> slot` index makes
+cancel/lookup expected O(1).
 `submit` builds a bounded `MatchPlan` in one traversal (preflighting every
 capacity and validity condition), then applies it infallibly: a rejected
 order mutates nothing, and no rollback machinery exists to drift out of

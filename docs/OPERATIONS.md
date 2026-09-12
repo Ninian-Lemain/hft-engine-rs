@@ -38,10 +38,11 @@ reclaims queue capacity. Treat `EventCapacityInvariant` and
 `PublicationInvariant` as fatal engine defects. They can occur only if the
 configured batch bound or the single-producer capacity contract is broken.
 
-For joint journal and event admission, verify the journal sequence, obtain an
-`admit` token, enqueue the encoded command, then call `apply`. Journal pressure
-drops the token without changing gateway state. An error after enqueue must
-stop admission. The integration tests cover both pressure paths and retry.
+The [engine facade](ENGINE.md) owns joint journal and event admission. It checks
+the journal sequence, obtains an `admit` token, enqueues the command, then calls
+`apply`. Journal pressure drops the token without changing gateway state. An
+error after enqueue stops admission. The lower-level APIs remain available for
+component use, but callers composing them must keep this ordering themselves.
 
 ## Journal Progress
 

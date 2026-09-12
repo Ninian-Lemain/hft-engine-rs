@@ -27,6 +27,7 @@ line using schema `hft-bench-results/1`. The suite covers:
 - bounded event admission, batch publication, and full-ring refusal
 - multi-instrument route publication, shard processing, event retrieval, and
   command-queue refusal
+- engine admission against direct event and journal composition
 
 Each record names its measurement boundary as component, gateway, or network.
 The current suite has component and gateway cells. It has no measured network
@@ -420,6 +421,37 @@ These mixed desktop results do not establish a speedup. The sink was memory,
 so flush timing does not represent storage durability latency.
 [Raw results](evidence/journal-status-2026-09-11.zip) include sample budgets,
 build details and binary hashes.
+
+## Engine Boundary
+
+Ten runs on 2026-09-12 compared `hft-engine` with direct composition of the
+event engine and journal writer in the same binary. Each cell alternates a
+resting new order and its cancel. The timer includes joint admission, journal
+enqueue, matching, and event publication. Event drain and persistence drain
+run outside the timer with a fixed sink that discards bytes.
+
+| Path | Median of run means | Range of run means | Admission owner and queues |
+| --- | ---: | ---: | ---: |
+| Direct composition | 137 ns | 125 to 190 ns | 69,560 bytes |
+| Engine facade | 140.5 ns | 125 to 252 ns | 69,648 bytes |
+
+The observed mean difference is +3.5 ns (+2.6%). Storage increases by 88 bytes
+(+0.13%) for this shape. Both paths record zero allocations and deallocations.
+They produce equal final snapshot digests and checksum `0000000000227068`.
+Storage totals include the admission owner and both queue buffers. They exclude
+the event consumer, persistence worker, and benchmark arrays.
+
+The facade adds persistence failure polling, sequence alignment checks, and
+lifecycle ownership. The direct path has no failure polling. This is a boundary
+cost comparison, not a before/after matching optimization or durability test.
+
+Each cell uses 128 warmup commands and 2,000 samples. Processes were pinned to
+logical CPU 2 on the AMD Windows reference host, without isolation or fixed
+frequency. Composition always ran first. Timer quantization and run order
+limit conclusions about small differences. All 126 suite cells retained their
+parameters, sample counts, checksums, and allocation counts across the ten
+runs. [Raw results](evidence/engine-2026-09-12.zip) include the build and binary
+hash. Linux overhead qualification remains open.
 
 ## Report Buffer Storage
 
